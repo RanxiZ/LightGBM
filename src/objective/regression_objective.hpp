@@ -666,7 +666,10 @@ class RegressionMAPELOSS : public RegressionL1loss {
   }
 
   bool IsConstantHessian() const override {
-    return true;
+    // Weighted MAPE returns per-row weights as Hessians. Treating them as
+    // constant makes histogram construction substitute a single row's
+    // Hessian and changes split gains for nonuniform weights.
+    return weights_ == nullptr;
   }
 
  private:

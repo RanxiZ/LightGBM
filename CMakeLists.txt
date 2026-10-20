@@ -10,6 +10,7 @@ option(USE_GPU "Enable GPU-accelerated training" OFF)
 option(USE_SWIG "Enable SWIG to generate Java API" OFF)
 option(USE_TIMETAG "Set to ON to output time costs" OFF)
 option(USE_CUDA "Enable CUDA-accelerated training " OFF)
+option(USE_NPU "Enable Ascend NPU-accelerated training (CANN)" OFF)
 option(USE_ROCM "Enable ROCm-accelerated training " OFF)
 option(USE_DEBUG "Set to ON for Debug mode" OFF)
 option(USE_SANITIZER "Use sanitizer flags" OFF)
@@ -186,6 +187,122 @@ endif()
 if(USE_ROCM)
     enable_language(HIP)
     set(USE_OPENMP ON CACHE BOOL "ROCm requires OpenMP" FORCE)
+endif()
+
+if(USE_NPU)
+    # Locate the CANN toolkit. ASCEND_TOOLKIT_HOME is exported by set_env.sh;
+    # fall back to the conventional install path when it is not set.
+    if(NOT DEFINED NPU_TOOLKIT_ROOT)
+        if(DEFINED ENV{ASCEND_TOOLKIT_HOME})
+            set(NPU_TOOLKIT_ROOT "$ENV{ASCEND_TOOLKIT_HOME}")
+        else()
+            set(NPU_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest")
+        endif()
+    endif()
+    find_path(
+        NPU_INCLUDE_DIR
+        NAMES acl/acl.h
+        HINTS
+          "${NPU_TOOLKIT_ROOT}/include"
+          "${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/include"
+        NO_DEFAULT_PATH
+    )
+    find_library(
+        NPU_ASCENDCL_LIBRARY
+        NAMES ascendcl
+        HINTS
+          "${NPU_TOOLKIT_ROOT}/lib64"
+          "${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
+        NO_DEFAULT_PATH
+    )
+    # libopapi provides the aclnn* single-operator entry points.
+    find_library(
+        NPU_OPAPI_LIBRARY
+        NAMES opapi
+        HINTS
+          "${NPU_TOOLKIT_ROOT}/lib64"
+          "${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
+        NO_DEFAULT_PATH
+    )
+    # libnnopbase provides aclCreateTensor / aclCreateScalar and the other
+    # aclnn tensor-descriptor helpers that libopapi entry points take.
+    find_library(
+        NPU_NNOPBASE_LIBRARY
+        NAMES nnopbase
+        HINTS
+          "${NPU_TOOLKIT_ROOT}/lib64"
+          "${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
+        NO_DEFAULT_PATH
+    )
+    if(NOT NPU_INCLUDE_DIR OR NOT NPU_ASCENDCL_LIBRARY OR NOT NPU_OPAPI_LIBRARY
+       OR NOT NPU_NNOPBASE_LIBRARY)
+        message(
+          FATAL_ERROR
+          "USE_NPU=ON but the CANN toolkit was not found under '${NPU_TOOLKIT_ROOT}'. "
+          "Source set_env.sh or pass -DNPU_TOOLKIT_ROOT=<path>."
+        )
+    endif()
+    # INLINE AICPU launch stubs need additional host-side CANN libraries.
+    # Keep the search restricted to this toolkit, including native ARM installs.
+    set(NPU_AICPU_LIBRARIES)
+    foreach(NPU_AICPU_LIBRARY_NAME IN ITEMS
+            ascendc_runtime runtime register error_manager profapi
+            ge_common_base unified_dlog mmpa ascend_dump c_sec)
+        string(TOUPPER "${NPU_AICPU_LIBRARY_NAME}" NPU_AICPU_LIBRARY_ID)
+        set(NPU_AICPU_LIBRARY_VAR "NPU_AICPU_${NPU_AICPU_LIBRARY_ID}_LIBRARY")
+        # Preserve static linkage for the AscendC runtime, as before.
+        if(NPU_AICPU_LIBRARY_NAME STREQUAL "ascendc_runtime")
+            set(NPU_AICPU_LIBRARY_FILE "libascendc_runtime.a")
+        else()
+            set(NPU_AICPU_LIBRARY_FILE "${NPU_AICPU_LIBRARY_NAME}")
+        endif()
+        find_library(
+            ${NPU_AICPU_LIBRARY_VAR}
+            NAMES ${NPU_AICPU_LIBRARY_FILE}
+            HINTS
+              "${NPU_TOOLKIT_ROOT}/lib64"
+              "${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
+            NO_DEFAULT_PATH
+        )
+        if(NOT ${NPU_AICPU_LIBRARY_VAR} OR NOT EXISTS "${${NPU_AICPU_LIBRARY_VAR}}")
+            message(FATAL_ERROR
+              "USE_NPU=ON requires the INLINE AICPU library '${NPU_AICPU_LIBRARY_NAME}' "
+              "under '${NPU_TOOLKIT_ROOT}/lib64' or "
+              "'${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64'."
+            )
+        endif()
+        list(APPEND NPU_AICPU_LIBRARIES "${${NPU_AICPU_LIBRARY_VAR}}")
+    endforeach()
+    find_program(
+        NPU_AICPU_COMPILER
+        NAMES bisheng
+        HINTS
+          "${NPU_TOOLKIT_ROOT}/tools/bisheng_compiler/bin"
+          "${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/tools/bisheng_compiler/bin"
+        NO_DEFAULT_PATH
+    )
+    find_path(
+        NPU_AICPU_INCLUDE_DIR
+        NAMES aicpu_api.h
+        HINTS
+          "${NPU_TOOLKIT_ROOT}/asc/include/aicpu_api"
+          "${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include/aicpu_api"
+        NO_DEFAULT_PATH
+    )
+    if(NOT NPU_AICPU_COMPILER OR NOT EXISTS "${NPU_AICPU_COMPILER}")
+        message(FATAL_ERROR
+          "USE_NPU=ON requires the CANN Bisheng compiler under '${NPU_TOOLKIT_ROOT}'."
+        )
+    endif()
+    if(NOT NPU_AICPU_INCLUDE_DIR OR NOT EXISTS "${NPU_AICPU_INCLUDE_DIR}/aicpu_api.h")
+        message(FATAL_ERROR
+          "USE_NPU=ON requires the INLINE AICPU header aicpu_api.h under '${NPU_TOOLKIT_ROOT}'."
+        )
+    endif()
+    add_definitions(-DUSE_NPU)
+    include_directories(${NPU_INCLUDE_DIR})
+    set(USE_OPENMP ON CACHE BOOL "NPU requires OpenMP" FORCE)
+    message(STATUS "Found CANN toolkit: ${NPU_TOOLKIT_ROOT}")
 endif()
 
 if(USE_OPENMP)
@@ -389,8 +506,14 @@ endif()
 
 set(LightGBM_HEADER_DIR ${PROJECT_SOURCE_DIR}/include)
 
-set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR})
-set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR})
+# Artifacts land in the source tree by default, as upstream expects. Set
+# LGBM_OUTPUT_DIR to keep several configurations (e.g. CPU and NPU) side by
+# side without overwriting each other's lib_lightgbm.
+if(NOT DEFINED LGBM_OUTPUT_DIR)
+  set(LGBM_OUTPUT_DIR ${PROJECT_SOURCE_DIR})
+endif()
+set(EXECUTABLE_OUTPUT_PATH ${LGBM_OUTPUT_DIR})
+set(LIBRARY_OUTPUT_PATH ${LGBM_OUTPUT_DIR})
 
 include_directories(${LightGBM_HEADER_DIR})
 
@@ -436,6 +559,16 @@ set(
       src/utils/openmp_wrapper.cpp
 )
 set(
+    LGBM_NPU_SOURCES
+      src/treelearner/npu_runtime.cpp
+      src/treelearner/npu_score_updater.cpp
+      src/treelearner/npu_best_split_finder.cpp
+      src/treelearner/npu_data_partition.cpp
+      src/treelearner/npu_gradient_stager.cpp
+      src/treelearner/npu_histogram_constructor.cpp
+      src/treelearner/npu_tree_learner.cpp
+)
+set(
     LGBM_CUDA_SOURCES
       src/boosting/cuda/cuda_score_updater.cpp
       src/boosting/cuda/cuda_score_updater.cu
@@ -477,6 +610,43 @@ if(USE_CUDA OR USE_ROCM)
   list(APPEND LGBM_SOURCES ${LGBM_CUDA_SOURCES})
 endif()
 
+if(USE_NPU)
+  list(APPEND LGBM_SOURCES ${LGBM_NPU_SOURCES})
+
+  # The FP64 fused paths are INLINE AICPU kernels.  CMake's normal C++
+  # compiler does not understand the .aicpu dialect, so compile these files
+  # with the CANN Bisheng compiler and link the generated host launch stubs
+  # into the same shared library as the NPU runtime.
+  set(NPU_AICPU_FLAGS
+      -O2 -ffp-contract=off -fPIC -std=c++17
+      -I${NPU_AICPU_INCLUDE_DIR}
+      -I${PROJECT_SOURCE_DIR}/src/treelearner
+      --cce-aicpu-L${NPU_TOOLKIT_ROOT}/lib64/device/lib64
+      --cce-aicpu-laicpu_api
+      --cce-aicpu-toolkit-path=${NPU_TOOLKIT_ROOT}/toolkit/toolchain/hcc/bin
+      --cce-aicpu-sysroot=${NPU_TOOLKIT_ROOT}/toolkit/toolchain/hcc/sysroot
+      --cce-aicpu-launch-with-interface)
+  set(LGBM_NPU_AICPU_OBJECTS)
+  foreach(NPU_AICPU_SOURCE
+          src/treelearner/npu_fused_split.aicpu
+          src/treelearner/npu_fused_histogram.aicpu)
+    get_filename_component(NPU_AICPU_NAME ${NPU_AICPU_SOURCE} NAME)
+    set(NPU_AICPU_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/${NPU_AICPU_NAME}.o)
+    add_custom_command(
+        OUTPUT ${NPU_AICPU_OBJECT}
+        COMMAND ${NPU_AICPU_COMPILER} ${NPU_AICPU_FLAGS}
+                -x aicpu ${PROJECT_SOURCE_DIR}/${NPU_AICPU_SOURCE}
+                -o ${NPU_AICPU_OBJECT}
+        DEPENDS ${PROJECT_SOURCE_DIR}/${NPU_AICPU_SOURCE}
+                ${PROJECT_SOURCE_DIR}/src/treelearner/npu_fused_split.h
+                ${PROJECT_SOURCE_DIR}/src/treelearner/npu_fused_histogram.h
+        VERBATIM)
+    set_source_files_properties(${NPU_AICPU_OBJECT} PROPERTIES GENERATED TRUE)
+    list(APPEND LGBM_NPU_AICPU_OBJECTS ${NPU_AICPU_OBJECT})
+  endforeach()
+  list(APPEND LGBM_SOURCES ${LGBM_NPU_AICPU_OBJECTS})
+endif()
+
 if(USE_ROCM)
   set(CU_FILES "")
   foreach(file IN LISTS LGBM_CUDA_SOURCES)
@@ -514,6 +684,16 @@ if(BUILD_STATIC_LIB)
   add_library(_lightgbm STATIC)
 else()
   add_library(_lightgbm SHARED)
+endif()
+
+if(USE_NPU)
+  # Object-library sources are not propagated as link inputs when they are
+  # prebuilt by a custom command. Add the AICPU launch stubs explicitly to
+  # both final link targets.
+  target_sources(_lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS})
+  if(BUILD_CLI)
+    target_sources(lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS})
+  endif()
 endif()
 
 # R expects libraries of the form <project>.{dll,dylib,so}, not lib_<project>.{dll,dylib,so}
@@ -616,6 +796,17 @@ if(USE_ROCM)
   target_link_libraries(lightgbm_objs PUBLIC ${RCCL_LIBRARY})
 endif()
 
+if(USE_NPU)
+  target_link_libraries(
+    lightgbm_objs
+    PUBLIC
+      ${NPU_ASCENDCL_LIBRARY}
+      ${NPU_OPAPI_LIBRARY}
+      ${NPU_NNOPBASE_LIBRARY}
+      ${NPU_AICPU_LIBRARIES}
+  )
+endif()
+
 if(__INTEGRATE_OPENCL)
   # targets OpenCL and Boost are added in IntegratedOpenCL.cmake
   add_dependencies(lightgbm_objs OpenCL Boost)
@@ -668,6 +859,39 @@ if(__BUILD_FOR_R)
   endif()
   target_link_libraries(lightgbm_objs PUBLIC ${R_LIB})
   target_link_libraries(lightgbm_capi_objs PUBLIC ${R_LIB})
+endif()
+
+if(USE_NPU)
+  # Real-device lifecycle regression is intentionally separate from the Google
+  # Test binary: it has its own process-level ACL setup and no CPU fallback.
+  enable_testing()
+  add_executable(npu_lifecycle_probe tests/cpp_tests/test_npu_lifecycle_probe.cpp)
+  add_executable(npu_histogram_probe tests/cpp_tests/test_npu_histogram_probe.cpp)
+  add_executable(npu_split_probe tests/cpp_tests/test_npu_split_probe.cpp)
+  add_executable(npu_quantized_tree_probe tests/cpp_tests/test_npu_quantized_tree_probe.cpp)
+  target_link_libraries(npu_quantized_tree_probe PRIVATE lightgbm_capi_objs)
+  foreach(npu_probe IN ITEMS npu_lifecycle_probe npu_histogram_probe npu_split_probe npu_quantized_tree_probe)
+    target_include_directories(${npu_probe} PRIVATE
+      ${PROJECT_SOURCE_DIR}/src/treelearner
+      ${NPU_INCLUDE_DIR}
+    )
+    target_link_libraries(${npu_probe} PRIVATE lightgbm_objs)
+    target_sources(${npu_probe} PRIVATE ${LGBM_NPU_AICPU_OBJECTS})
+  endforeach()
+  add_test(NAME npu_lifecycle_probe COMMAND npu_lifecycle_probe)
+  add_test(NAME npu_histogram_probe COMMAND npu_histogram_probe)
+  add_test(NAME npu_quantized_histogram_probe COMMAND npu_histogram_probe quantized)
+  add_test(NAME npu_quantized_split_scan_probe COMMAND npu_histogram_probe quantized_scan)
+  add_test(NAME npu_quantized_split_evaluation_probe COMMAND npu_histogram_probe quantized_eval)
+  add_test(NAME npu_quantized_split_selection_probe COMMAND npu_histogram_probe quantized_select)
+  add_test(NAME npu_quantized_tree_probe COMMAND npu_quantized_tree_probe)
+  add_test(NAME npu_quantized_booster_probe COMMAND npu_quantized_tree_probe --booster)
+  add_test(NAME npu_quantized_booster_host_probe COMMAND npu_quantized_tree_probe --booster-host)
+  add_test(NAME npu_split_probe COMMAND npu_split_probe split)
+  add_test(NAME npu_fused_split_probe COMMAND npu_split_probe fused_split)
+  foreach(npu_op IN ITEMS prefix gain gain_l1 argmax abs sign clamp adds subs mul div neg)
+    add_test(NAME npu_split_${npu_op} COMMAND npu_split_probe ${npu_op})
+  endforeach()
 endif()
 
 #-- Google C++ tests

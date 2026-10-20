@@ -226,7 +226,7 @@ Tree* SerialTreeLearner::Train(const score_t* gradients, const score_t *hessians
       FindBestSplits(tree_ptr);
     }
     // Get a leaf with max split gain
-    int best_leaf = static_cast<int>(ArrayArgs<SplitInfo>::ArgMax(best_split_per_leaf_));
+    int best_leaf = SelectBestLeaf();
     // Get split information for best leaf
     const SplitInfo& best_leaf_SplitInfo = best_split_per_leaf_[best_leaf];
     // cannot split, quit
@@ -240,8 +240,7 @@ Tree* SerialTreeLearner::Train(const score_t* gradients, const score_t *hessians
   }
 
   if (config_->use_quantized_grad && config_->quant_train_renew_leaf) {
-    gradient_discretizer_->RenewIntGradTreeOutput(tree.get(), config_, data_partition_.get(), gradients_, hessians_,
-      [this] (int leaf_index) { return GetGlobalDataCountInLeaf(leaf_index); });
+    RenewQuantizedTreeOutput(tree.get());
   }
 
   Log::Debug("Trained a tree with leaves = %d and depth = %d", tree->num_leaves(), cur_depth);
@@ -790,9 +789,9 @@ void SerialTreeLearner::SplitInner(Tree* tree, int best_leaf, int* left_leaf,
   if (is_numerical_split) {
     auto threshold_double = train_data_->RealThreshold(
         inner_feature_index, best_split_info.threshold);
-    data_partition_->Split(best_leaf, train_data_, inner_feature_index,
-                           &best_split_info.threshold, 1,
-                           best_split_info.default_left, next_leaf_id);
+    PartitionData(best_leaf, inner_feature_index,
+                  &best_split_info.threshold, 1,
+                  best_split_info.default_left, next_leaf_id);
     if (update_cnt) {
       // don't need to update this in data-based parallel model
       best_split_info.left_count = data_partition_->leaf_count(*left_leaf);
@@ -824,10 +823,9 @@ void SerialTreeLearner::SplitInner(Tree* tree, int best_leaf, int* left_leaf,
     std::vector<uint32_t> cat_bitset = Common::ConstructBitset(
         threshold_int.data(), best_split_info.num_cat_threshold);
 
-    data_partition_->Split(best_leaf, train_data_, inner_feature_index,
-                           cat_bitset_inner.data(),
-                           static_cast<int>(cat_bitset_inner.size()),
-                           best_split_info.default_left, next_leaf_id);
+    PartitionData(best_leaf, inner_feature_index,
+                  cat_bitset_inner.data(), static_cast<int>(cat_bitset_inner.size()),
+                  best_split_info.default_left, next_leaf_id);
 
     if (update_cnt) {
       // don't need to update this in data-based parallel model
@@ -858,46 +856,46 @@ void SerialTreeLearner::SplitInner(Tree* tree, int best_leaf, int* left_leaf,
   if (!config_->use_quantized_grad) {
     if (best_split_info.left_count < best_split_info.right_count) {
       CHECK_GT(best_split_info.left_count, 0);
-      smaller_leaf_splits_->Init(*left_leaf, data_partition_.get(),
-                                 best_split_info.left_sum_gradient,
-                                 best_split_info.left_sum_hessian,
-                                 best_split_info.left_output);
-      larger_leaf_splits_->Init(*right_leaf, data_partition_.get(),
-                                best_split_info.right_sum_gradient,
-                                best_split_info.right_sum_hessian,
-                                best_split_info.right_output);
+      InitLeafSplits(smaller_leaf_splits_.get(), *left_leaf,
+                     best_split_info.left_sum_gradient,
+                     best_split_info.left_sum_hessian,
+                     best_split_info.left_output);
+      InitLeafSplits(larger_leaf_splits_.get(), *right_leaf,
+                     best_split_info.right_sum_gradient,
+                     best_split_info.right_sum_hessian,
+                     best_split_info.right_output);
     } else {
       CHECK_GT(best_split_info.right_count, 0);
-      smaller_leaf_splits_->Init(*right_leaf, data_partition_.get(),
-                                 best_split_info.right_sum_gradient,
-                                 best_split_info.right_sum_hessian,
-                                 best_split_info.right_output);
-      larger_leaf_splits_->Init(*left_leaf, data_partition_.get(),
-                                best_split_info.left_sum_gradient,
-                                best_split_info.left_sum_hessian,
-                                best_split_info.left_output);
+      InitLeafSplits(smaller_leaf_splits_.get(), *right_leaf,
+                     best_split_info.right_sum_gradient,
+                     best_split_info.right_sum_hessian,
+                     best_split_info.right_output);
+      InitLeafSplits(larger_leaf_splits_.get(), *left_leaf,
+                     best_split_info.left_sum_gradient,
+                     best_split_info.left_sum_hessian,
+                     best_split_info.left_output);
     }
   } else {
     if (best_split_info.left_count < best_split_info.right_count) {
       CHECK_GT(best_split_info.left_count, 0);
-      smaller_leaf_splits_->Init(*left_leaf, data_partition_.get(),
+      InitQuantizedLeafSplits(smaller_leaf_splits_.get(), *left_leaf,
                                  best_split_info.left_sum_gradient,
                                  best_split_info.left_sum_hessian,
                                  best_split_info.left_sum_gradient_and_hessian,
                                  best_split_info.left_output);
-      larger_leaf_splits_->Init(*right_leaf, data_partition_.get(),
+      InitQuantizedLeafSplits(larger_leaf_splits_.get(), *right_leaf,
                                  best_split_info.right_sum_gradient,
                                  best_split_info.right_sum_hessian,
                                  best_split_info.right_sum_gradient_and_hessian,
                                  best_split_info.right_output);
     } else {
       CHECK_GT(best_split_info.right_count, 0);
-      smaller_leaf_splits_->Init(*right_leaf, data_partition_.get(),
+      InitQuantizedLeafSplits(smaller_leaf_splits_.get(), *right_leaf,
                                  best_split_info.right_sum_gradient,
                                  best_split_info.right_sum_hessian,
                                  best_split_info.right_sum_gradient_and_hessian,
                                  best_split_info.right_output);
-      larger_leaf_splits_->Init(*left_leaf, data_partition_.get(),
+      InitQuantizedLeafSplits(larger_leaf_splits_.get(), *left_leaf,
                                 best_split_info.left_sum_gradient,
                                 best_split_info.left_sum_hessian,
                                 best_split_info.left_sum_gradient_and_hessian,

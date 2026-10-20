@@ -111,8 +111,10 @@ void GradientDiscretizer::DiscretizeGradients(
   } else {
     hessian_scale_ = max_hessian_abs_ / static_cast<double>(num_grad_quant_bins_);
   }
-  inverse_gradient_scale_ = 1.0f / gradient_scale_;
-  inverse_hessian_scale_ = 1.0f / hessian_scale_;
+  // A zero gradient vector quantizes to exact zeros. Avoid 0 * infinity and
+  // an undefined NaN-to-int8 conversion (also for zero nonconstant Hessians).
+  inverse_gradient_scale_ = gradient_scale_ > 0.0 ? 1.0 / gradient_scale_ : 0.0;
+  inverse_hessian_scale_ = hessian_scale_ > 0.0 ? 1.0 / hessian_scale_ : 0.0;
 
   const int random_values_use_start = random_values_use_start_dist_(random_values_use_start_eng_);
   int8_t* discretized_int8 = discretized_gradients_and_hessians_vector_.data();

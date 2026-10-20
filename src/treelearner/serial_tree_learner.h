@@ -151,6 +151,12 @@ class SerialTreeLearner: public TreeLearner {
 
   virtual void FindBestSplitsFromHistograms(const std::vector<int8_t>& is_feature_used, bool use_subtract, const Tree*);
 
+  // Select among per-leaf candidates after histogram search. Serial keeps
+  // its original comparison; device learners can reduce the same candidates.
+  virtual int SelectBestLeaf() const {
+    return static_cast<int>(ArrayArgs<SplitInfo>::ArgMax(best_split_per_leaf_));
+  }
+
   /*!
   * \brief Partition tree and data according best split.
   * \param tree Current tree, will be splitted on this function.
@@ -161,6 +167,32 @@ class SerialTreeLearner: public TreeLearner {
   inline virtual void Split(Tree* tree, int best_leaf, int* left_leaf,
     int* right_leaf) {
     SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
+  }
+
+  // Override only the row routing while retaining the serial tree, leaf
+  // statistics and constraint bookkeeping. The default remains CPU partitioning.
+  virtual void PartitionData(int leaf, int feature, const uint32_t* threshold,
+                             int num_threshold, bool default_left, int right_leaf) {
+    data_partition_->Split(leaf, train_data_, feature, threshold,
+                           num_threshold, default_left, right_leaf);
+  }
+
+  // Device backends may initialize statistics without a CPU row-index pointer.
+  virtual void InitLeafSplits(LeafSplits* splits, int leaf, double sum_gradient,
+                              double sum_hessian, double output) {
+    splits->Init(leaf, data_partition_.get(), sum_gradient, sum_hessian, output);
+  }
+
+  virtual void InitQuantizedLeafSplits(LeafSplits* splits, int leaf, double sum_gradient,
+                                       double sum_hessian, int64_t packed, double output) {
+    splits->Init(leaf, data_partition_.get(), sum_gradient, sum_hessian, packed, output);
+  }
+
+  // Device learners may materialize rows explicitly or implement device
+  // reductions before renewing quantized leaf outputs from raw gradients.
+  virtual void RenewQuantizedTreeOutput(Tree* tree) {
+    gradient_discretizer_->RenewIntGradTreeOutput(tree, config_, data_partition_.get(), gradients_, hessians_,
+      [this](int leaf_index) { return GetGlobalDataCountInLeaf(leaf_index); });
   }
 
   void SplitInner(Tree* tree, int best_leaf, int* left_leaf, int* right_leaf,

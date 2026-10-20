@@ -199,6 +199,8 @@ void GetDeviceType(const std::unordered_map<std::string, std::string>& params, s
       *device_type = "gpu";
     } else if (value == std::string("cuda")) {
       *device_type = "cuda";
+    } else if (value == std::string("npu") || value == std::string("ascend")) {
+      *device_type = "npu";
     } else {
       Log::Fatal("Unknown device type %s", value.c_str());
     }
@@ -420,6 +422,21 @@ void Config::CheckParamConflict(const std::unordered_map<std::string, std::strin
     force_row_wise = true;
     if (deterministic) {
       Log::Warning("Although \"deterministic\" is set, the results ran by GPU may be non-deterministic.");
+    }
+  } else if (device_type == std::string("npu")) {
+    // the NPU histogram kernel is column-wise over feature groups
+    force_col_wise = true;
+    force_row_wise = false;
+    if (use_quantized_grad) {
+      // Reject before configuration normalization can hide the request from
+      // NPUTreeLearner::ValidateConfig(). Integer histogram probes alone do
+      // not establish end-to-end quantized training support.
+      Log::Fatal("device_type=npu does not support use_quantized_grad");
+    }
+    if (linear_tree) {
+      // The generic linear-tree rule below switches unsupported devices to
+      // CPU. NPU requests must fail explicitly instead of changing backend.
+      Log::Fatal("device_type=npu does not support linear_tree");
     }
   }
   // linear tree learner must be serial type and run on CPU device

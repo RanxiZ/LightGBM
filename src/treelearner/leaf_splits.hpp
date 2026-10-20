@@ -38,6 +38,24 @@ class LeafSplits {
   ~LeafSplits() {
   }
 
+  // Initialize device-backed leaf statistics without retaining a host index
+  // pointer. The backend supplies row membership to histogram construction.
+  void InitFromDevice(int leaf, data_size_t count, double sum_gradients,
+                      double sum_hessians, double weight) {
+    leaf_index_ = leaf;
+    num_data_in_leaf_ = count;
+    data_indices_ = nullptr;
+    sum_gradients_ = sum_gradients;
+    sum_hessians_ = sum_hessians;
+    weight_ = weight;
+    int_sum_gradients_and_hessians_ = 0;
+  }
+  void InitQuantizedFromDevice(int leaf, data_size_t count, double sum_gradients,
+                               double sum_hessians, int64_t packed, double weight) {
+    InitFromDevice(leaf, count, sum_gradients, sum_hessians, weight);
+    int_sum_gradients_and_hessians_ = packed;
+  }
+
   /*!
   * \brief Init split on current leaf on partial data.
   * \param leaf Index of current leaf
@@ -120,16 +138,14 @@ class LeafSplits {
     data_indices_ = nullptr;
     double tmp_sum_gradients = 0.0f;
     double tmp_sum_hessians = 0.0f;
-    const int16_t* packed_int_gradients_and_hessians = reinterpret_cast<const int16_t*>(int_gradients_and_hessians);
     int64_t tmp_sum_gradients_and_hessians = 0;
 #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static, 512) reduction(+:tmp_sum_gradients, tmp_sum_hessians, tmp_sum_gradients_and_hessians) if (num_data_in_leaf_ >= 1024 && !deterministic_)
     for (data_size_t i = 0; i < num_data_in_leaf_; ++i) {
       tmp_sum_gradients += int_gradients_and_hessians[2 * i + 1] * grad_scale;
-      tmp_sum_hessians += int_gradients_and_hessians[2 * i] * hess_scale;
-      const int16_t packed_int_grad_and_hess = packed_int_gradients_and_hessians[i];
+      tmp_sum_hessians += static_cast<uint8_t>(int_gradients_and_hessians[2 * i]) * hess_scale;
       const int64_t packed_long_int_grad_and_hess =
-        (static_cast<int64_t>(static_cast<int8_t>(packed_int_grad_and_hess >> 8)) << 32) |
-        (static_cast<int64_t>(packed_int_grad_and_hess & 0x00ff));
+          static_cast<int64_t>(int_gradients_and_hessians[2 * i + 1]) * int64_t{4294967296} +
+          static_cast<uint8_t>(int_gradients_and_hessians[2 * i]);
       tmp_sum_gradients_and_hessians += packed_long_int_grad_and_hess;
     }
     sum_gradients_ = tmp_sum_gradients;
@@ -177,17 +193,15 @@ class LeafSplits {
     data_indices_ = data_partition->GetIndexOnLeaf(leaf, &num_data_in_leaf_);
     double tmp_sum_gradients = 0.0f;
     double tmp_sum_hessians = 0.0f;
-    const int16_t* packed_int_gradients_and_hessians = reinterpret_cast<const int16_t*>(int_gradients_and_hessians);
     int64_t tmp_sum_gradients_and_hessians = 0;
 #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static, 512) reduction(+:tmp_sum_gradients, tmp_sum_hessians, tmp_sum_gradients_and_hessians) if (num_data_in_leaf_ >= 1024 && !deterministic_)
     for (data_size_t i = 0; i < num_data_in_leaf_; ++i) {
       const data_size_t idx = data_indices_[i];
       tmp_sum_gradients += int_gradients_and_hessians[2 * idx + 1] * grad_scale;
-      tmp_sum_hessians += int_gradients_and_hessians[2 * idx] * hess_scale;
-      const int16_t packed_int_grad_and_hess = packed_int_gradients_and_hessians[i];
+      tmp_sum_hessians += static_cast<uint8_t>(int_gradients_and_hessians[2 * idx]) * hess_scale;
       const int64_t packed_long_int_grad_and_hess =
-        (static_cast<int64_t>(static_cast<int8_t>(packed_int_grad_and_hess >> 8)) << 32) |
-        (static_cast<int64_t>(packed_int_grad_and_hess & 0x00ff));
+          static_cast<int64_t>(int_gradients_and_hessians[2 * idx + 1]) * int64_t{4294967296} +
+          static_cast<uint8_t>(int_gradients_and_hessians[2 * idx]);
       tmp_sum_gradients_and_hessians += packed_long_int_grad_and_hess;
     }
     sum_gradients_ = tmp_sum_gradients;

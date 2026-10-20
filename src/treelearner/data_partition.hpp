@@ -123,6 +123,38 @@ class DataPartition {
     leaf_count_[right_leaf] = cnt - left_cnt;
   }
 
+  // Update the serial leaf layout without reading the reordered device rows.
+  // Indices in the affected span remain stale until SetLeafIndices is called.
+  void SetSplitCounts(int leaf, int right_leaf, data_size_t count,
+                      data_size_t left_count) {
+    CHECK_GE(leaf, 0);
+    CHECK_LT(leaf, num_leaves_);
+    CHECK_GE(right_leaf, 0);
+    CHECK_LT(right_leaf, num_leaves_);
+    CHECK_NE(leaf, right_leaf);
+    CHECK_EQ(count, leaf_count_[leaf]);
+    CHECK_GE(left_count, 0);
+    CHECK_LE(left_count, count);
+    const data_size_t begin = leaf_begin_[leaf];
+    CHECK_LE(static_cast<int64_t>(begin) + count, num_data_);
+    leaf_count_[leaf] = left_count;
+    leaf_begin_[right_leaf] = begin + left_count;
+    leaf_count_[right_leaf] = count - left_count;
+  }
+
+  // Materialize a final device leaf when host index consumers need it.
+  void SetLeafIndices(int leaf, const data_size_t* rows, data_size_t count) {
+    CHECK_GE(leaf, 0);
+    CHECK_LT(leaf, num_leaves_);
+    CHECK_EQ(count, leaf_count_[leaf]);
+    const data_size_t begin = leaf_begin_[leaf];
+    CHECK_LE(static_cast<int64_t>(begin) + count, num_data_);
+    if (count != 0) {
+      CHECK(rows != nullptr);
+      std::memcpy(indices_.data() + begin, rows, static_cast<size_t>(count) * sizeof(data_size_t));
+    }
+  }
+
   /*!
   * \brief SetLabelAt used data indices before training, used for bagging
   * \param used_data_indices indices of used data

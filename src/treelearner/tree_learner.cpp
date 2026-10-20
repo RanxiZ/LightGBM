@@ -11,6 +11,7 @@
 #include "parallel_tree_learner.h"
 #include "serial_tree_learner.h"
 #include "cuda/cuda_single_gpu_tree_learner.hpp"
+#include "npu_tree_learner.h"
 
 namespace LightGBM {
 
@@ -49,6 +50,12 @@ TreeLearner* TreeLearner::CreateTreeLearner(const std::string& learner_type, con
       return new CUDASingleGPUTreeLearner(config, boosting_on_cuda);
     } else {
       Log::Fatal("Currently cuda version only supports training on a single machine.");
+    }
+  } else if (device_type == std::string("npu")) {
+    if (learner_type == std::string("serial")) {
+      return new NPUTreeLearner(config);
+    } else {
+      Log::Fatal("Currently the npu version only supports training on a single machine.");
     }
   }
   return nullptr;

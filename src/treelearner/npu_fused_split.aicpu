@@ -1,0 +1,214 @@
+/* Copyright (c) 2026. Licensed under the MIT License. */
+#include "aicpu_api.h"
+#define LGBM_AICPU_DEVICE_SOURCE
+#include "npu_fused_split.h"
+
+// Native FP64 executes on the device's INLINE AICPU, never on the host CPU.
+// Build with -ffp-contract=off: intermediate rounding, especially the
+// reverse-direction subtract/add round trip, is part of split selection.
+namespace {
+// LightGBM's kEpsilon is initialized from an FP32 literal, even when score_t
+// is double. Preserve that value when widening to FP64.
+constexpr double kSplitEpsilon = static_cast<double>(1e-15f);
+
+inline double ThresholdL1(double gradient, double lambda_l1) {
+  if (lambda_l1 <= 0.0) return gradient;
+  const double magnitude = __builtin_fabs(gradient) - lambda_l1;
+  const double clipped = magnitude > 0.0 ? magnitude : 0.0;
+  return __builtin_copysign(clipped, gradient);
+}
+
+inline double LeafOutput(
+    double gradient, double hessian, int64_t count,
+    const LGBMNPUFusedSplitParameters& p) {
+  double output = -ThresholdL1(gradient, p.lambda_l1) / (hessian + p.lambda_l2);
+  if (p.max_delta_step > 0.0) {
+    if (output < -p.max_delta_step) output = -p.max_delta_step;
+    if (output > p.max_delta_step) output = p.max_delta_step;
+  }
+  if (p.path_smooth > 0.0) {
+    const double ratio = static_cast<double>(count) / p.path_smooth;
+    output = output * ratio / (ratio + 1.0) + p.parent_output / (ratio + 1.0);
+  }
+  return output;
+}
+
+inline double LeafGain(
+    double gradient, double hessian, int64_t count,
+    const LGBMNPUFusedSplitParameters& p) {
+  const double thresholded = ThresholdL1(gradient, p.lambda_l1);
+  if (p.max_delta_step <= 0.0 && p.path_smooth <= 0.0) {
+    return thresholded * thresholded / (hessian + p.lambda_l2);
+  }
+  const double output = LeafOutput(gradient, hessian, count, p);
+  return -(2.0 * thresholded * output +
+           (hessian + p.lambda_l2) * output * output);
+}
+
+struct DirectionWinner {
+  bool valid;
+  uint32_t threshold;
+  double current_gain;
+  double left_gradient;
+  double right_gradient;
+  double left_hessian;
+  double right_hessian;
+  int64_t left_count;
+  int64_t right_count;
+};
+
+// Stored Hessians are nonnegative. This is Common::RoundInt's truncation of
+// hessian*factor+0.5, independently for each bin (not a rounded prefix).
+inline int64_t BinCount(double hessian, double factor) {
+  return static_cast<int64_t>(hessian * factor + 0.5);
+}
+
+inline DirectionWinner ScanDirection(
+    const double* gradients, const double* hessians,
+    const LGBMNPUFusedSplitFeature& f,
+    const LGBMNPUFusedSplitParameters& p,
+    bool reverse, bool double_scan, double total_hessian,
+    double count_factor, double gain_shift) {
+  DirectionWinner best = {};
+  double accumulated_gradient = 0.0;
+  double accumulated_hessian = kSplitEpsilon;
+  int64_t accumulated_count = 0;
+  int first = reverse
+      ? f.num_bin - 1 - f.offset - (double_scan && f.missing_type == 2)
+      : 0;
+  const int last = reverse ? 1 - f.offset : f.num_bin - 2 - f.offset;
+  if (!reverse && f.missing_type == 2 && f.offset == 1) {
+    // Preserve the resident ACL scanner's residual evaluation order: sum all
+    // stored bins, subtract once, then seed its prefix with epsilon. This is
+    // deliberately not an arithmetic operation on downloaded histogram data.
+    double stored_gradient = 0.0, stored_hessian = 0.0;
+    int64_t stored_count = 0;
+    for (int bin = 0; bin < f.num_bin - f.offset; ++bin) {
+      stored_gradient += gradients[bin];
+      stored_hessian += hessians[bin];
+      stored_count += BinCount(hessians[bin], count_factor);
+    }
+    accumulated_gradient = p.sum_gradient - stored_gradient;
+    accumulated_hessian = (p.sum_hessian - stored_hessian) + kSplitEpsilon;
+    accumulated_count = static_cast<int64_t>(p.num_data) - stored_count;
+    first = -1;
+  }
+  for (int bin = first; reverse ? bin >= last : bin <= last;
+       bin += reverse ? -1 : 1) {
+    if (double_scan && f.missing_type == 1 && bin + f.offset == f.default_bin) {
+      continue;
+    }
+    if (bin >= 0) {
+      accumulated_gradient += gradients[bin];
+      accumulated_hessian += hessians[bin];
+      accumulated_count += BinCount(hessians[bin], count_factor);
+    }
+    const int64_t left_count = reverse
+        ? static_cast<int64_t>(p.num_data) - accumulated_count : accumulated_count;
+    const int64_t right_count = static_cast<int64_t>(p.num_data) - left_count;
+    const double left_hessian = reverse
+        ? total_hessian - accumulated_hessian : accumulated_hessian;
+    const double right_hessian = reverse
+        ? accumulated_hessian : total_hessian - accumulated_hessian;
+    // Match the existing vector scanner's validity mask; it evaluates every
+    // prefix rather than depending on a monotonic early-exit assumption.
+    if (left_count < p.min_data_in_leaf || right_count < p.min_data_in_leaf ||
+        left_hessian < p.min_sum_hessian_in_leaf ||
+        right_hessian < p.min_sum_hessian_in_leaf) {
+      continue;
+    }
+    const int threshold = reverse ? bin - 1 + f.offset : bin + f.offset;
+    if (f.randomized && threshold != f.random_threshold) continue;
+    const double left_gradient = reverse
+        ? p.sum_gradient - accumulated_gradient : accumulated_gradient;
+    const double right_gradient = reverse
+        ? accumulated_gradient : p.sum_gradient - accumulated_gradient;
+    const double current_gain = LeafGain(left_gradient, left_hessian, left_count, p) +
+                                LeafGain(right_gradient, right_hessian, right_count, p);
+    if (!(current_gain > gain_shift)) continue;
+    // First equal-gain candidate wins within a scan, before any penalty.
+    if (!best.valid || current_gain > best.current_gain) {
+      best.valid = true;
+      best.threshold = static_cast<uint32_t>(threshold);
+      best.current_gain = current_gain;
+      best.left_gradient = left_gradient;
+      best.right_gradient = right_gradient;
+      best.left_hessian = left_hessian;
+      best.right_hessian = right_hessian;
+      best.left_count = left_count;
+      best.right_count = right_count;
+    }
+  }
+  return best;
+}
+}  // namespace
+
+extern "C" __global__ __aicpu__ unsigned int LGBMNPUFusedSplitKernel(
+    const double* histogram, const LGBMNPUFusedSplitFeature* features,
+    const LGBMNPUFusedSplitParameters* parameters,
+    LGBMNPUFusedSplitWinner* winner, uint8_t* splittable) {
+  const LGBMNPUFusedSplitParameters& p = *parameters;
+  LGBMNPUFusedSplitWinner result = {};
+  result.feature = -1;
+  const double total_hessian = p.sum_hessian + 2.0 * kSplitEpsilon;
+  const double count_factor = static_cast<double>(p.num_data) / total_hessian;
+  const double gain_shift = LeafGain(p.sum_gradient, total_hessian, p.num_data, p) +
+                            p.min_gain_to_split;
+  for (int index = 0; index < p.num_features; ++index) {
+    const LGBMNPUFusedSplitFeature& f = features[index];
+    splittable[f.input_index] = 0;
+    if (f.num_bin <= 1) continue;
+    const int64_t begin = static_cast<int64_t>(f.histogram_index) * p.histogram_stride;
+    const double* gradients = histogram + begin;
+    const double* hessians = histogram + p.histogram_plane + begin;
+    const bool double_scan = f.num_bin > 2 && f.missing_type != 0;
+    DirectionWinner chosen = ScanDirection(gradients, hessians, f, p, true,
+                                           double_scan, total_hessian,
+                                           count_factor, gain_shift);
+    bool reverse = true;
+    if (double_scan) {
+      const DirectionWinner forward = ScanDirection(gradients, hessians, f, p, false,
+                                                    true, total_hessian,
+                                                    count_factor, gain_shift);
+      splittable[f.input_index] = chosen.valid || forward.valid;
+      // The CPU scanner stores reverse_gain-shift and adds shift back before
+      // accepting the forward winner. Do not reduce the two shifted gains.
+      if (forward.valid && (!chosen.valid ||
+          forward.current_gain > (chosen.current_gain - gain_shift) + gain_shift)) {
+        chosen = forward;
+        reverse = false;
+      }
+    } else {
+      splittable[f.input_index] = chosen.valid;
+    }
+    if (!chosen.valid || !f.enabled) continue;
+    const double gain = (chosen.current_gain - gain_shift) * f.penalty;
+    if (result.feature >= 0 && !(gain > result.gain)) continue;
+    // Feature metadata is stable-sorted, so equal-gain features retain the
+    // first (lowest original feature index), including zero penalties.
+    result.feature = f.feature;
+    result.threshold = chosen.threshold;
+    result.default_left = reverse && !(f.missing_type == 2 && !double_scan);
+    result.gain = gain;
+    result.left_gradient = chosen.left_gradient;
+    // CPU serializes the right side by subtracting its stored left side,
+    // even for a reverse scan. Preserve that FP64 round trip separately
+    // from gain evaluation, which uses the original accumulated right side.
+    const double output_right_gradient = p.sum_gradient - chosen.left_gradient;
+    const double output_right_hessian = total_hessian - chosen.left_hessian;
+    result.right_gradient = output_right_gradient;
+    result.left_hessian = chosen.left_hessian - kSplitEpsilon;
+    result.right_hessian = output_right_hessian - kSplitEpsilon;
+    result.left_count = static_cast<int32_t>(chosen.left_count);
+    result.right_count = static_cast<int32_t>(chosen.right_count);
+    result.left_output = LeafOutput(chosen.left_gradient, chosen.left_hessian,
+                                    chosen.left_count, p);
+    result.right_output = LeafOutput(output_right_gradient, output_right_hessian,
+                                     chosen.right_count, p);
+  }
+  result.completed = 1;
+  *winner = result;
+  AscendC::DataStoreBarrier();
+  return 0;
+}
+

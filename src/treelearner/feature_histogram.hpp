@@ -116,7 +116,7 @@ class FeatureHistogram {
           const int32_t other_grad_hess = static_cast<int32_t>(other_int_data[i]);
           const int64_t this_grad_hess = this_int_data[i];
           const int64_t other_grad_hess_int64 =
-            (static_cast<int64_t>(static_cast<int16_t>(other_grad_hess >> 16)) << 32) |
+            (static_cast<int64_t>(static_cast<int16_t>(other_grad_hess >> 16)) * int64_t{4294967296}) |
             (static_cast<int64_t>(other_grad_hess & 0x0000ffff));
           const int64_t result_grad_hess = this_grad_hess - other_grad_hess_int64;
           result_int_data[i] = static_cast<RESULT_HIST_T>(result_grad_hess);
@@ -126,11 +126,11 @@ class FeatureHistogram {
           const int32_t other_grad_hess = static_cast<int32_t>(other_int_data[i]);
           const int64_t this_grad_hess = this_int_data[i];
           const int64_t other_grad_hess_int64 =
-            (static_cast<int64_t>(static_cast<int16_t>(other_grad_hess >> 16)) << 32) |
+            (static_cast<int64_t>(static_cast<int16_t>(other_grad_hess >> 16)) * int64_t{4294967296}) |
             (static_cast<int64_t>(other_grad_hess & 0x0000ffff));
           const int64_t result_grad_hess = this_grad_hess - other_grad_hess_int64;
           const int32_t result_grad_hess_int32 =
-            (static_cast<int32_t>(result_grad_hess >> 32) << 16) |
+            (static_cast<int32_t>(result_grad_hess >> 32) * int32_t{65536}) |
             static_cast<int32_t>(result_grad_hess & 0x00000000ffffffff);
           result_int_data[i] = result_grad_hess_int32;
         }
@@ -159,7 +159,7 @@ class FeatureHistogram {
     int64_t* int32_data = reinterpret_cast<int64_t*>(buffer);
     for (int i = 0; i < meta_->num_bin - meta_->offset; ++i) {
       const int32_t int16_val = int16_data[i];
-      int32_data[i] = (static_cast<int64_t>(static_cast<int16_t>(int16_val >> 16)) << 32) |
+      int32_data[i] = (static_cast<int64_t>(static_cast<int16_t>(int16_val >> 16)) * int64_t{4294967296}) |
         static_cast<int64_t>(int16_val & 0x0000ffff);
     }
   }
@@ -1069,9 +1069,11 @@ class FeatureHistogram {
                                         int rand_threshold, double parent_output) {
     const int8_t offset = meta_->offset;
     PACKED_HIST_ACC_T best_sum_left_gradient_and_hessian = 0;
+    // The signed gradient fits its accumulator half. Multiplication preserves
+    // the packed representation without left-shifting a negative value.
     PACKED_HIST_ACC_T local_int_sum_gradient_and_hessian =
       HIST_BITS_ACC == 16 ?
-      ((static_cast<int32_t>(int_sum_gradient_and_hessian >> 32) << 16) | static_cast<int32_t>(int_sum_gradient_and_hessian & 0x0000ffff)) :
+      ((static_cast<int32_t>(int_sum_gradient_and_hessian >> 32) * int32_t{65536}) | static_cast<int32_t>(int_sum_gradient_and_hessian & 0x0000ffff)) :
       static_cast<PACKED_HIST_ACC_T>(int_sum_gradient_and_hessian);
     double best_gain = kMinScore;
     uint32_t best_threshold = static_cast<uint32_t>(meta_->num_bin);
@@ -1110,9 +1112,9 @@ class FeatureHistogram {
         const PACKED_HIST_BIN_T grad_and_hess = data_ptr[t];
         if (HIST_BITS_ACC != HIST_BITS_BIN) {
           const PACKED_HIST_ACC_T grad_and_hess_acc = HIST_BITS_BIN == 16 ?
-            ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) << HIST_BITS_ACC) |
+            ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) * (int64_t{1} << HIST_BITS_ACC)) |
             (static_cast<PACKED_HIST_ACC_T>(grad_and_hess & 0x0000ffff))) :
-            ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) << HIST_BITS_ACC) |
+            ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) * (int64_t{1} << HIST_BITS_ACC)) |
             (static_cast<PACKED_HIST_ACC_T>(grad_and_hess & 0x00000000ffffffff)));
           sum_right_gradient_and_hessian += grad_and_hess_acc;
         } else {
@@ -1203,9 +1205,9 @@ class FeatureHistogram {
             const PACKED_HIST_BIN_T grad_and_hess = data_ptr[i];
             if (HIST_BITS_ACC != HIST_BITS_BIN) {
               const PACKED_HIST_ACC_T grad_and_hess_acc = HIST_BITS_BIN == 16 ?
-                ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) << HIST_BITS_ACC) |
+                ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) * (int64_t{1} << HIST_BITS_ACC)) |
                 (static_cast<PACKED_HIST_ACC_T>(grad_and_hess & 0x0000ffff))) :
-                ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) << HIST_BITS_ACC) |
+                ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) * (int64_t{1} << HIST_BITS_ACC)) |
                 (static_cast<PACKED_HIST_ACC_T>(grad_and_hess & 0x00000000ffffffff)));
               sum_left_gradient_and_hessian -= grad_and_hess_acc;
             } else {
@@ -1226,9 +1228,9 @@ class FeatureHistogram {
           const PACKED_HIST_BIN_T grad_and_hess = data_ptr[t];
           if (HIST_BITS_ACC != HIST_BITS_BIN) {
             const PACKED_HIST_ACC_T grad_and_hess_acc = HIST_BITS_BIN == 16 ?
-              ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) << HIST_BITS_ACC) |
+              ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) * (int64_t{1} << HIST_BITS_ACC)) |
               (static_cast<PACKED_HIST_ACC_T>(grad_and_hess & 0x0000ffff))) :
-              ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) << HIST_BITS_ACC) |
+              ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) * (int64_t{1} << HIST_BITS_ACC)) |
               (static_cast<PACKED_HIST_ACC_T>(grad_and_hess & 0x00000000ffffffff)));
             sum_left_gradient_and_hessian += grad_and_hess_acc;
           } else {
@@ -1313,7 +1315,7 @@ class FeatureHistogram {
       const double best_sum_left_gradient = static_cast<double>(int_best_sum_left_gradient) * grad_scale;
       const double best_sum_left_hessian = static_cast<double>(int_best_sum_left_hessian) * hess_scale;
       const int64_t best_sum_left_gradient_and_hessian_int64 = HIST_BITS_ACC == 16 ?
-          ((static_cast<int64_t>(static_cast<int16_t>(best_sum_left_gradient_and_hessian >> 16)) << 32) |
+          ((static_cast<int64_t>(static_cast<int16_t>(best_sum_left_gradient_and_hessian >> 16)) * int64_t{4294967296}) |
           static_cast<int64_t>(best_sum_left_gradient_and_hessian & 0x0000ffff)) :
           best_sum_left_gradient_and_hessian;
       const int64_t best_sum_right_gradient_and_hessian = int_sum_gradient_and_hessian - best_sum_left_gradient_and_hessian_int64;
