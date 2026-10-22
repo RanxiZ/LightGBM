@@ -2,6 +2,7 @@
 #include "npu_runtime.h"
 #include "npu_fused_split.h"
 #include "npu_fused_histogram.h"
+#include "simt_fixed_point.h"
 
 #include <LightGBM/utils/log.h>
 #include <LightGBM/meta.h>
@@ -60,6 +61,33 @@ namespace {
                  detail_ != nullptr ? detail_ : "no detail");            \
     }                                                                    \
   } while (0)
+
+// Scheduling policy of the AI Core SIMT fused histogram kernel, mirrored from
+// npu_fused_histogram_simt_v2.asc. Grid = (partitions, row_chunks); each block
+// owns kFeaturesPerBlock used features and a window of rows.
+constexpr int kSimtFeaturesPerBlock = 4;
+constexpr int kSimtMaxGrid = 65535;
+constexpr int64_t kSimtRowsPerChunk = 8192;  // bounds the per-block flush cost
+constexpr int kSimtTargetBlocks = 512;       // total blocks across both axes
+constexpr int kSimtMaxRowChunks = 4096;
+
+int SelectKernelStride(int histogram_stride) {
+  if (histogram_stride <= 32) return 32;
+  if (histogram_stride <= 64) return 64;
+  if (histogram_stride <= 128) return 128;
+  return 256;
+}
+
+int PlanRowChunks(int64_t count, int partitions) {
+  int64_t chunks = (count + kSimtRowsPerChunk - 1) / kSimtRowsPerChunk;
+  if (chunks < 1) chunks = 1;
+  const int64_t target = std::max<int64_t>(1, kSimtTargetBlocks / partitions);
+  if (chunks > target) chunks = target;
+  if (chunks > kSimtMaxRowChunks) chunks = kSimtMaxRowChunks;
+  const int64_t grid_cap = std::max<int64_t>(1, kSimtMaxGrid / partitions);
+  if (chunks > grid_cap) chunks = grid_cap;
+  return static_cast<int>(chunks);
+}
 
 // ACL is process-global. Reference-count it so a refit or reset can create a
 // second runtime without calling aclInit() while another runtime is alive.
@@ -293,6 +321,24 @@ struct NPURuntime::Impl {
   std::vector<DeviceBuffer> histogram_tiles;
   DeviceBuffer histogram_tile_pointers;
   DeviceBuffer histogram_gradients, histogram_hessians;
+  // --- AI Core SIMT fused histogram (v2) dataset-lifetime state -----------
+  // row_bins is a dense [row][feature] int32 matrix of *stored* bin indices
+  // (bin - offset) with -1 for omitted / out-of-range bins, matching the v2
+  // operator contract. Row-major so the kF lanes of one row read contiguous
+  // words. The feature-major `histogram_tiles` above remain the input of the
+  // ACL fallback and the fused split kernel.
+  DeviceBuffer histogram_row_bins;      // int32[rows][features]
+  DeviceBuffer histogram_stored_bins;   // int32[features]
+  // Derived from the used mask and rebuilt when it changes.
+  std::vector<int8_t> simt_metadata_used;
+  int simt_num_used = 0;
+  int simt_partitions = 1;
+  int simt_kernel_stride = 32;
+  DeviceBuffer simt_feature_index;      // int32[num_used]
+  DeviceBuffer simt_bin_max;            // uint32[2][num_used][kernel_stride]
+  DeviceBuffer simt_partials;           // int64[6][num_used][kernel_stride]
+  DeviceBuffer simt_shift;              // int32[2*features*histogram_stride]
+  DeviceBuffer simt_counters;           // int32[partitions]
   DeviceBuffer quantized_gradients, quantized_hessians;
   uint64_t dataset_generation = 0, quantized_generation = 0;
   bool quantized_ready = false;
@@ -340,6 +386,40 @@ struct NPURuntime::Impl {
     ACL_CHECK(aclrtMemset(buffer.data(), bytes, 0, bytes));
     return buffer;
   }
+
+  // The partial layout, grid shape and metadata of the SIMT histogram depend
+  // only on the used mask, so they are rebuilt only when the mask changes.
+  // Every scratch buffer the kernels touch is zeroed here; from then on the
+  // kernel resets them itself at the end of each build.
+  void EnsureSimtMetadata(const std::vector<int8_t>& used) {
+    if (used == simt_metadata_used && simt_feature_index.data() != nullptr) return;
+    simt_metadata_used = used;
+    simt_num_used =
+        static_cast<int>(std::count(used.begin(), used.end(), static_cast<int8_t>(1)));
+    CHECK_LE(simt_num_used, kSimtMaxGrid);
+    simt_partitions = simt_num_used > 0
+                          ? (simt_num_used + kSimtFeaturesPerBlock - 1) /
+                                kSimtFeaturesPerBlock
+                          : 1;
+    simt_kernel_stride = SelectKernelStride(histogram_stride);
+    CHECK_GE(simt_kernel_stride, histogram_stride);
+
+    std::vector<int32_t> slots;
+    slots.reserve(static_cast<size_t>(simt_num_used));
+    for (int i = 0; i < static_cast<int>(used.size()); ++i) {
+      if (!used[static_cast<size_t>(i)]) continue;
+      slots.push_back(static_cast<int32_t>(i));
+    }
+    simt_feature_index = Upload(slots.data(), slots.size() * sizeof(slots[0]));
+
+    const size_t slot_elements =
+        static_cast<size_t>(simt_num_used) * static_cast<size_t>(simt_kernel_stride);
+    simt_bin_max = Zeros(2 * slot_elements * sizeof(uint32_t));
+    simt_partials = Zeros(6 * slot_elements * sizeof(int64_t));
+    simt_counters = Zeros(static_cast<size_t>(simt_partitions) * sizeof(int32_t));
+    simt_shift = Zeros(static_cast<size_t>(2) * static_cast<size_t>(histogram_bin_counts.size()) *
+                       static_cast<size_t>(histogram_stride) * sizeof(int32_t));
+  }
 };
 
 NPURuntime::NPURuntime(int device) : impl_(new Impl) {
@@ -360,6 +440,13 @@ NPURuntime::~NPURuntime() {
   impl_->histogram_tiles.clear();
   impl_->histogram_gradients = DeviceBuffer();
   impl_->histogram_hessians = DeviceBuffer();
+  impl_->histogram_row_bins = DeviceBuffer();
+  impl_->histogram_stored_bins = DeviceBuffer();
+  impl_->simt_feature_index = DeviceBuffer();
+  impl_->simt_bin_max = DeviceBuffer();
+  impl_->simt_partials = DeviceBuffer();
+  impl_->simt_shift = DeviceBuffer();
+  impl_->simt_counters = DeviceBuffer();
   impl_->quantized_gradients = DeviceBuffer();
   impl_->quantized_hessians = DeviceBuffer();
   impl_->quantized_ready = false;
@@ -389,6 +476,14 @@ void NPURuntime::SetHistogramBins(const std::vector<std::vector<uint32_t>>& bins
   impl_->histogram_tiles.clear();
   impl_->histogram_gradients = DeviceBuffer();
   impl_->histogram_hessians = DeviceBuffer();
+  impl_->histogram_row_bins = DeviceBuffer();
+  impl_->histogram_stored_bins = DeviceBuffer();
+  impl_->simt_metadata_used.clear();
+  impl_->simt_feature_index = DeviceBuffer();
+  impl_->simt_bin_max = DeviceBuffer();
+  impl_->simt_partials = DeviceBuffer();
+  impl_->simt_shift = DeviceBuffer();
+  impl_->simt_counters = DeviceBuffer();
   impl_->quantized_gradients = DeviceBuffer();
   impl_->quantized_hessians = DeviceBuffer();
   impl_->quantized_ready = false;
@@ -433,6 +528,39 @@ void NPURuntime::SetHistogramBins(const std::vector<std::vector<uint32_t>>& bins
   }
   impl_->histogram_tile_pointers = impl_->Upload(
       tile_pointers.data(), tile_pointers.size() * sizeof(const int32_t*));
+  // Row-major packing for the AI Core SIMT fused histogram kernel
+  // (npu_fused_histogram_simt_v2.asc). One dense [row][feature] int32 matrix
+  // holds the *stored* index bin - offset, or -1 for every bin the kernel must
+  // skip (bin < offset, bin >= num_bins, or the omitted most-frequent bin).
+  // -1 is unambiguous because a stored index is always >= 0. Row-major lets
+  // the kF feature lanes of one block read kF contiguous words and share the
+  // row index / gradient / Hessian loads.
+  if (impl_->histogram_rows > 0 && !bins.empty()) {
+    const size_t features = bins.size();
+    const size_t packed_elements =
+        features * static_cast<size_t>(impl_->histogram_rows);
+    std::vector<int32_t> packed(packed_elements, -1);
+    for (size_t feature = 0; feature < features; ++feature) {
+      const int offset = offsets[feature];
+      // The omitted bin is not stored: with offset == 1 it is always bin 0,
+      // which matches LightGBM's BinMapper contract.
+      const int omitted = offset == 1 ? 0 : impl_->histogram_most_frequent[feature];
+      for (int64_t row = 0; row < impl_->histogram_rows; ++row) {
+        const int64_t bin = bins[feature][static_cast<size_t>(row)];
+        if (bin < offset || bin >= num_bins[feature] || bin == omitted) continue;
+        packed[static_cast<size_t>(row) * features + feature] =
+            static_cast<int32_t>(bin - offset);
+      }
+    }
+    impl_->histogram_row_bins =
+        impl_->Upload(packed.data(), packed.size() * sizeof(int32_t));
+    std::vector<int32_t> stored(features);
+    for (size_t feature = 0; feature < features; ++feature) {
+      stored[feature] = num_bins[feature] - offsets[feature];
+    }
+    impl_->histogram_stored_bins =
+        impl_->Upload(stored.data(), stored.size() * sizeof(int32_t));
+  }
   CHECK_LE(impl_->histogram_rows, std::numeric_limits<int32_t>::max());
   if (impl_->histogram_rows > 0) {
     std::vector<int32_t> positions(static_cast<size_t>(impl_->histogram_rows));
@@ -488,39 +616,37 @@ NPURuntime::HistogramHandle NPURuntime::BuildHistogramFromDeviceRows(
   ++histogram_calls_;
   if (count == 0 || used.empty()) return result;
   CHECK(device_row_indices != nullptr);
-  CHECK(impl_->histogram_gradients.data() != nullptr);
-  CHECK(impl_->histogram_hessians.data() != nullptr);
-  // Default to the fused path validated by the full Alpha158 workflow.
-  // It replaces gather/expand/cast/scatter chains with one INLINE AICPU
-  // launch; FP64 rows still execute serially within each selected feature.
-  // Set LGBM_NPU_DISABLE_FUSED_HISTOGRAM to retain the ACL operator path.
+  // Default to the AI Core SIMT fused path: two dependent device launches
+  // (scan, then histogram+finalize) replace the gather/expand/cast/scatter
+  // chains. Set LGBM_NPU_DISABLE_FUSED_HISTOGRAM to retain the ACL operator
+  // path, which remains the fallback for comparison and debugging.
   if (std::getenv("LGBM_NPU_DISABLE_FUSED_HISTOGRAM") == nullptr) {
-    std::vector<LGBMNPUFusedHistogramFeature> features;
-    for (size_t i = 0; i < used.size(); ++i) {
-      if (!used[i]) continue;
-      LGBMNPUFusedHistogramFeature feature = {};
-      feature.output_index = static_cast<int32_t>(i);
-      feature.tile_index = static_cast<int32_t>(i / Impl::kHistogramTile);
-      feature.tile_feature = static_cast<int32_t>(i % Impl::kHistogramTile);
-      feature.num_bins = impl_->histogram_bin_counts[i];
-      feature.offset = impl_->histogram_offsets[i];
-      features.push_back(feature);
-    }
-    if (features.empty()) return result;
-    DeviceBuffer metadata = impl_->Upload(features.data(), features.size() * sizeof(features[0]));
-    DeviceBuffer completion = impl_->Zeros(sizeof(int32_t));
-    LGBMNPUFusedHistogramKernel(1, nullptr, impl_->stream,
-        static_cast<const int32_t* const*>(impl_->histogram_tile_pointers.data()),
-        device_row_indices, static_cast<const float*>(impl_->histogram_gradients.data()),
+    CHECK(impl_->histogram_row_bins.data() != nullptr);
+    CHECK(impl_->histogram_gradients.data() != nullptr);
+    CHECK(impl_->histogram_hessians.data() != nullptr);
+    impl_->EnsureSimtMetadata(used);
+    if (impl_->simt_num_used == 0) return result;
+    const int row_chunks = PlanRowChunks(count, impl_->simt_partitions);
+    // shift_gap sets the coarse grid so that count * 2^shift_gap stays inside
+    // the 61-bit signed window (see simt_fixed_point.h).
+    const int32_t shift_gap = 61 - lgbm_simt::CeilLog2Count(count);
+    LGBMNFusedHistogramSimtV2Launch(
+        impl_->stream,
+        static_cast<const int32_t*>(impl_->histogram_row_bins.data()),
+        device_row_indices,
+        static_cast<const float*>(impl_->histogram_gradients.data()),
         static_cast<const float*>(impl_->histogram_hessians.data()),
-        static_cast<const LGBMNPUFusedHistogramFeature*>(metadata.data()),
-        static_cast<double*>(result->values.data()), static_cast<int32_t>(features.size()),
-        result->features, count, static_cast<int32_t>(impl_->histogram_rows),
-        result->stride, Impl::kHistogramTile, static_cast<int32_t*>(completion.data()));
+        static_cast<const int32_t*>(impl_->simt_feature_index.data()),
+        static_cast<const int32_t*>(impl_->histogram_stored_bins.data()),
+        static_cast<uint32_t*>(impl_->simt_bin_max.data()),
+        static_cast<int32_t*>(impl_->simt_shift.data()),
+        static_cast<int64_t*>(impl_->simt_partials.data()),
+        static_cast<int32_t*>(impl_->simt_counters.data()),
+        static_cast<double*>(result->values.data()), result->features,
+        impl_->simt_num_used, count, impl_->histogram_stride,
+        impl_->simt_partitions, row_chunks, impl_->simt_kernel_stride,
+        shift_gap, 1);
     ACL_CHECK(aclrtSynchronizeStream(impl_->stream));
-    int32_t completed = 0;
-    impl_->Download(&completed, completion, sizeof(completed));
-    if (completed != 1) Log::Fatal("NPU fused histogram kernel did not complete");
     return result;
   }
   TensorHandle t_rows(const_cast<int32_t*>(device_row_indices), {count}, ACL_INT32);

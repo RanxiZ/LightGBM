@@ -645,6 +645,83 @@ if(USE_NPU)
     list(APPEND LGBM_NPU_AICPU_OBJECTS ${NPU_AICPU_OBJECT})
   endforeach()
   list(APPEND LGBM_SOURCES ${LGBM_NPU_AICPU_OBJECTS})
+
+  # -------------------------------------------------------------------------
+  # AI Core SIMT fused histogram. The device operator is written in the
+  # Bisheng AI Core SIMT dialect (`.asc`, CUDA-like kernels executed on the AI
+  # Core). The host C++ compiler cannot parse it, so it is compiled separately:
+  #
+  #   bisheng --enable-simt --npu-arch=dav-3510 ... -dc --asc-aicore-lang
+  #
+  # The resulting object carries the device image and a host launch wrapper
+  # that references the CCE stub entry points (__cce_rtKernelLaunchWithFlagV2,
+  # ...). Those stubs are injected only by the CCE linker wrapper, so a second
+  # relocatable-link step (`bisheng -r`) bundles the object with the stub
+  # definitions. The bundle is then linked by the regular C++ linker; only
+  # libascendcl is strictly required (libruntime is a DT_NEEDED of libascendcl
+  # and provides the runtime launch symbols), but the executable link must name
+  # runtime/profapi explicitly because ld does not follow transitive DT_NEEDED
+  # entries. The object is built with -fPIC because it ends up inside
+  # lib_lightgbm.so.
+  # -------------------------------------------------------------------------
+  set(NPU_SIMT_ARCH "dav-3510" CACHE STRING
+      "NPU architecture for the AI Core SIMT histogram kernel")
+  find_library(
+      NPU_RUNTIME_LIBRARY
+      NAMES runtime
+      HINTS
+        "${NPU_TOOLKIT_ROOT}/lib64"
+        "${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
+      NO_DEFAULT_PATH
+  )
+  find_library(
+      NPU_PROFAPI_LIBRARY
+      NAMES profapi
+      HINTS
+        "${NPU_TOOLKIT_ROOT}/lib64"
+        "${NPU_TOOLKIT_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
+      NO_DEFAULT_PATH
+  )
+  if(NOT NPU_RUNTIME_LIBRARY OR NOT NPU_PROFAPI_LIBRARY)
+    message(FATAL_ERROR
+      "USE_NPU=ON requires the CANN runtime/profapi libraries under "
+      "'${NPU_TOOLKIT_ROOT}'.")
+  endif()
+  message(STATUS "NPU SIMT architecture: ${NPU_SIMT_ARCH}")
+
+  # Flags mirror the standalone v2 operator build, plus -fPIC because the
+  # object is linked into the shared library.
+  set(NPU_SIMT_FLAGS
+      --enable-simt -std=c++17
+      --npu-arch=${NPU_SIMT_ARCH} -O3 -DNDEBUG -fPIC -dc
+      --asc-aicore-lang
+      -I${PROJECT_SOURCE_DIR}/src
+      -I${PROJECT_SOURCE_DIR}/src/treelearner
+      -I${NPU_INCLUDE_DIR})
+  set(NPU_SIMT_SOURCE
+      ${PROJECT_SOURCE_DIR}/src/treelearner/npu_fused_histogram_simt_v2.asc)
+  set(NPU_SIMT_OBJECT
+      ${CMAKE_CURRENT_BINARY_DIR}/npu_fused_histogram_simt_v2.asc.o)
+  set(NPU_SIMT_BUNDLE
+      ${CMAKE_CURRENT_BINARY_DIR}/npu_fused_histogram_simt_v2.bundle.o)
+  add_custom_command(
+      OUTPUT ${NPU_SIMT_OBJECT}
+      COMMAND ${NPU_AICPU_COMPILER} ${NPU_SIMT_FLAGS}
+              -c ${NPU_SIMT_SOURCE} -o ${NPU_SIMT_OBJECT}
+      DEPENDS ${NPU_SIMT_SOURCE}
+              ${PROJECT_SOURCE_DIR}/src/treelearner/npu_fused_histogram.h
+              ${PROJECT_SOURCE_DIR}/src/treelearner/simt_fixed_point.h
+      COMMENT "Compiling AI Core SIMT histogram kernel"
+      VERBATIM)
+  add_custom_command(
+      OUTPUT ${NPU_SIMT_BUNDLE}
+      COMMAND ${NPU_AICPU_COMPILER} -r --npu-arch=${NPU_SIMT_ARCH}
+              ${NPU_SIMT_OBJECT} -o ${NPU_SIMT_BUNDLE}
+      DEPENDS ${NPU_SIMT_OBJECT}
+      COMMENT "Bundling AI Core SIMT kernel with CCE launch stubs"
+      VERBATIM)
+  set_source_files_properties(${NPU_SIMT_BUNDLE}
+      PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 endif()
 
 if(USE_ROCM)
@@ -688,11 +765,11 @@ endif()
 
 if(USE_NPU)
   # Object-library sources are not propagated as link inputs when they are
-  # prebuilt by a custom command. Add the AICPU launch stubs explicitly to
-  # both final link targets.
-  target_sources(_lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS})
+  # prebuilt by a custom command. Add the AICPU launch stubs and the AI Core
+  # SIMT bundle explicitly to both final link targets.
+  target_sources(_lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS} ${NPU_SIMT_BUNDLE})
   if(BUILD_CLI)
-    target_sources(lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS})
+    target_sources(lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS} ${NPU_SIMT_BUNDLE})
   endif()
 endif()
 
@@ -804,6 +881,8 @@ if(USE_NPU)
       ${NPU_OPAPI_LIBRARY}
       ${NPU_NNOPBASE_LIBRARY}
       ${NPU_AICPU_LIBRARIES}
+      ${NPU_RUNTIME_LIBRARY}
+      ${NPU_PROFAPI_LIBRARY}
   )
 endif()
 
@@ -876,7 +955,7 @@ if(USE_NPU)
       ${NPU_INCLUDE_DIR}
     )
     target_link_libraries(${npu_probe} PRIVATE lightgbm_objs)
-    target_sources(${npu_probe} PRIVATE ${LGBM_NPU_AICPU_OBJECTS})
+    target_sources(${npu_probe} PRIVATE ${LGBM_NPU_AICPU_OBJECTS} ${NPU_SIMT_BUNDLE})
   endforeach()
   add_test(NAME npu_lifecycle_probe COMMAND npu_lifecycle_probe)
   add_test(NAME npu_histogram_probe COMMAND npu_histogram_probe)
