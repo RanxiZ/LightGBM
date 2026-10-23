@@ -722,6 +722,64 @@ if(USE_NPU)
       VERBATIM)
   set_source_files_properties(${NPU_SIMT_BUNDLE}
       PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
+  # -------------------------------------------------------------------------
+  # AI Core SIMT best-split finder (fused split on the AI Core).
+  #
+  # This operator cannot share the front end above. It is written against the
+  # *legacy* AscendC programming model (`__simt_vf__`, `asc_vf_call`,
+  # `asc_shfl_*`) and is built by `ascendc.cmake` with SOC_VERSION
+  # `ascend950pr_9579`, which also emits the `aclrtlaunch_*.h` host stubs that
+  # the operator runtime calls. The new ASC front end (`--enable-simt`) does
+  # not define `__simt_vf__` and cannot parse `kernel_operator.h`.
+  #
+  # `ascendc.cmake` sets global compile options, so it runs in a nested CMake
+  # project (cmake/split_simt_standalone) driven by ExternalProject. The two
+  # archives are imported here and linked into lib_lightgbm.so; the histogram
+  # build above is unaffected.
+  # -------------------------------------------------------------------------
+  include(ExternalProject)
+  set(NPU_SIMT_SPLIT_BUILD_DIR
+      ${CMAKE_CURRENT_BINARY_DIR}/simt_split_standalone)
+  set(NPU_SIMT_SPLIT_DEVICE_LIB
+      ${NPU_SIMT_SPLIT_BUILD_DIR}/lib/liblgbm_npu_simt_split.a)
+  set(NPU_SIMT_SPLIT_OPERATOR_LIB
+      ${NPU_SIMT_SPLIT_BUILD_DIR}/lib/liblgbm_npu_simt_split_operator.a)
+  ExternalProject_Add(lgbm_npu_simt_split_ext
+      PREFIX ${CMAKE_CURRENT_BINARY_DIR}/simt_split_ext
+      SOURCE_DIR ${PROJECT_SOURCE_DIR}/cmake/split_simt_standalone
+      BINARY_DIR ${NPU_SIMT_SPLIT_BUILD_DIR}
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND /bin/bash
+                    ${PROJECT_SOURCE_DIR}/cmake/split_simt_standalone/build.sh
+                    ${PROJECT_SOURCE_DIR}/cmake/split_simt_standalone
+                    ${NPU_SIMT_SPLIT_BUILD_DIR}
+                    ${PROJECT_SOURCE_DIR}
+                    ${NPU_TOOLKIT_ROOT}
+      INSTALL_COMMAND ""
+      UPDATE_COMMAND ""
+      BUILD_ALWAYS 1
+      BUILD_BYPRODUCTS ${NPU_SIMT_SPLIT_DEVICE_LIB}
+                       ${NPU_SIMT_SPLIT_OPERATOR_LIB}
+      LOG_BUILD ON
+      COMMENT "Building AI Core SIMT best-split finder (legacy front end)")
+
+  add_library(lgbm_npu_simt_split_device STATIC IMPORTED GLOBAL)
+  set_target_properties(lgbm_npu_simt_split_device PROPERTIES
+      IMPORTED_LOCATION ${NPU_SIMT_SPLIT_DEVICE_LIB})
+  add_library(lgbm_npu_simt_split_operator STATIC IMPORTED GLOBAL)
+  set_target_properties(lgbm_npu_simt_split_operator PROPERTIES
+      IMPORTED_LOCATION ${NPU_SIMT_SPLIT_OPERATOR_LIB}
+      INTERFACE_INCLUDE_DIRECTORIES
+        "${PROJECT_SOURCE_DIR}/src/treelearner;${NPU_INCLUDE_DIR}"
+      INTERFACE_LINK_LIBRARIES
+        "lgbm_npu_simt_split_device;${NPU_ASCENDCL_LIBRARY}")
+
+  # The histogram -> FP32 conversion the split finder needs is an aclnnCast on
+  # the resident FP64 planes, issued by npu_runtime.cpp, so it needs no target
+  # here. (A SIMT conversion kernel cannot be used: the dav-3510 vector target
+  # lowers the FP64->FP32 conversion to a `__truncdfsf2` libcall, which the
+  # SIMT backend rejects.)
 endif()
 
 if(USE_ROCM)
@@ -766,10 +824,16 @@ endif()
 if(USE_NPU)
   # Object-library sources are not propagated as link inputs when they are
   # prebuilt by a custom command. Add the AICPU launch stubs and the AI Core
-  # SIMT bundle explicitly to both final link targets.
-  target_sources(_lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS} ${NPU_SIMT_BUNDLE})
+  # SIMT bundles explicitly to both final link targets.
+  target_sources(_lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS}
+                 ${NPU_SIMT_BUNDLE})
   if(BUILD_CLI)
-    target_sources(lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS} ${NPU_SIMT_BUNDLE})
+    target_sources(lightgbm PRIVATE ${LGBM_NPU_AICPU_OBJECTS}
+                   ${NPU_SIMT_BUNDLE})
+  endif()
+  add_dependencies(_lightgbm lgbm_npu_simt_split_ext)
+  if(BUILD_CLI)
+    add_dependencies(lightgbm lgbm_npu_simt_split_ext)
   endif()
 endif()
 
@@ -874,9 +938,16 @@ if(USE_ROCM)
 endif()
 
 if(USE_NPU)
+  # The split archives go first: they reference `aclrtlaunch_*` (device image)
+  # and `LaunchAscendKernel` / `RegisterAscendBinary` from the static
+  # libascendc_runtime.a that appears later in `${NPU_AICPU_LIBRARIES}`. Static
+  # archives are processed left to right, so the referencing library must come
+  # before the provider.
   target_link_libraries(
     lightgbm_objs
     PUBLIC
+      lgbm_npu_simt_split_operator
+      lgbm_npu_simt_split_device
       ${NPU_ASCENDCL_LIBRARY}
       ${NPU_OPAPI_LIBRARY}
       ${NPU_NNOPBASE_LIBRARY}
@@ -955,7 +1026,9 @@ if(USE_NPU)
       ${NPU_INCLUDE_DIR}
     )
     target_link_libraries(${npu_probe} PRIVATE lightgbm_objs)
-    target_sources(${npu_probe} PRIVATE ${LGBM_NPU_AICPU_OBJECTS} ${NPU_SIMT_BUNDLE})
+    target_sources(${npu_probe} PRIVATE ${LGBM_NPU_AICPU_OBJECTS}
+                   ${NPU_SIMT_BUNDLE})
+    add_dependencies(${npu_probe} lgbm_npu_simt_split_ext)
   endforeach()
   add_test(NAME npu_lifecycle_probe COMMAND npu_lifecycle_probe)
   add_test(NAME npu_histogram_probe COMMAND npu_histogram_probe)
@@ -968,6 +1041,8 @@ if(USE_NPU)
   add_test(NAME npu_quantized_booster_host_probe COMMAND npu_quantized_tree_probe --booster-host)
   add_test(NAME npu_split_probe COMMAND npu_split_probe split)
   add_test(NAME npu_fused_split_probe COMMAND npu_split_probe fused_split)
+  # Same fixtures through the AI Core SIMT finder (FP32 contract P1).
+  add_test(NAME npu_fused_split_simt_probe COMMAND npu_split_probe fused_split_simt)
   foreach(npu_op IN ITEMS prefix gain gain_l1 argmax abs sign clamp adds subs mul div neg)
     add_test(NAME npu_split_${npu_op} COMMAND npu_split_probe ${npu_op})
   endforeach()

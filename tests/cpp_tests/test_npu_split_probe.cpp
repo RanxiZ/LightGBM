@@ -125,9 +125,48 @@ void ProbePrimitive(const std::string& op) {
     }
   }
 }
-void ProbeFusedNumericSplit(LightGBM::NPURuntime* runtime) {
+// Scoped override of a switch that the runtime reads with std::getenv.
+class ScopedEnvOverride {
+ public:
+  explicit ScopedEnvOverride(const char* name) : name_(name) {
+    const char* current = std::getenv(name);
+    if (current != nullptr) {
+      present_ = true;
+      value_ = current;
+    }
+  }
+  void Set(const char* value) { setenv(name_.c_str(), value, 1); }
+  void Clear() { unsetenv(name_.c_str()); }
+  ~ScopedEnvOverride() {
+    if (present_) {
+      setenv(name_.c_str(), value_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_, value_;
+  bool present_ = false;
+};
+
+void ProbeFusedNumericSplit(LightGBM::NPURuntime* runtime, bool simt) {
   // Compare the resident fused path with the existing ACL numeric scanner.
   // Host aggregation below is a test oracle only, never a training fallback.
+  //
+  // With `simt == false` the AI Core SIMT finder is switched off, so this
+  // compares the FP64 AI CPU kernel with the ACL scanner at 1e-12: that is the
+  // contract of the fallback path. With `simt == true` the same fixtures run
+  // through the AI Core SIMT finder, which is FP32 by contract (P1), so the
+  // statistics are compared with an FP32 tolerance and a near-tie is allowed
+  // to pick a different task.
+  ScopedEnvOverride simt_switch("LGBM_NPU_DISABLE_SIMT_SPLIT");
+  if (simt) {
+    simt_switch.Clear();
+  } else {
+    simt_switch.Set("1");
+  }
+  const double tolerance = simt ? 1e-5 : 1e-12;
   const std::vector<float> gradients{-3, -3, -2, -2, -1, -1, 1, 1, 2, 2, 3, 3};
   const std::vector<float> hessians(gradients.size(), 1.0f);
   std::vector<uint32_t> bins(gradients.size());
@@ -173,13 +212,36 @@ void ProbeFusedNumericSplit(LightGBM::NPURuntime* runtime) {
         }
         auto reference = runtime->FindBestSplit(features, 0.0, 12.0, 12, l1, 1.0,
             minimum_count, 1e-3, 0.0, nullptr, max_delta, smoothing, 0.3);
-        if (fused.feature != reference.feature || fused.threshold != reference.threshold ||
-            fused.default_left != reference.default_left ||
-            fused.left_count != reference.left_count || fused.right_count != reference.right_count ||
-            fused.splittable != reference.splittable) {
+        if (fused.splittable != reference.splittable ||
+            fused.default_left != reference.default_left) {
           throw std::runtime_error("fused numeric metadata differs from ACL reference: offset=" +
               std::to_string(offset) + " missing=" + std::to_string(missing) +
               " mode=" + std::to_string(mode));
+        }
+        // An FP32 tie between two tasks can legitimately pick a different one.
+        const bool same_task =
+            fused.feature == reference.feature && fused.threshold == reference.threshold;
+        const bool near_tie =
+            std::fabs(fused.gain - reference.gain) <= tolerance * (1.0 + std::fabs(reference.gain));
+        if (!same_task && !near_tie) {
+          throw std::runtime_error("fused numeric metadata differs from ACL reference: offset=" +
+              std::to_string(offset) + " missing=" + std::to_string(missing) +
+              " mode=" + std::to_string(mode) +
+              " feature=" + std::to_string(fused.feature) + "/" +
+              std::to_string(reference.feature));
+        }
+        if (!same_task && !simt) {
+          throw std::runtime_error("fused numeric metadata differs from ACL reference: offset=" +
+              std::to_string(offset) + " missing=" + std::to_string(missing) +
+              " mode=" + std::to_string(mode));
+        }
+        if (!same_task) {
+          // Different task: its counts and threshold belong to another split.
+          continue;
+        }
+        if (fused.left_count != reference.left_count ||
+            fused.right_count != reference.right_count) {
+          throw std::runtime_error("fused numeric counts differ from ACL reference");
         }
         const double actual[]{fused.gain, fused.left_output, fused.right_output,
             fused.left_gradient, fused.right_gradient, fused.left_hessian, fused.right_hessian};
@@ -188,7 +250,7 @@ void ProbeFusedNumericSplit(LightGBM::NPURuntime* runtime) {
             reference.left_hessian, reference.right_hessian};
         for (size_t stat = 0; stat < sizeof(actual) / sizeof(actual[0]); ++stat) {
           if (!std::isfinite(actual[stat]) ||
-              std::fabs(actual[stat] - expected[stat]) > 1e-12 * (1.0 + std::fabs(expected[stat]))) {
+              std::fabs(actual[stat] - expected[stat]) > tolerance * (1.0 + std::fabs(expected[stat]))) {
             throw std::runtime_error("fused numeric statistics differ from ACL reference");
           }
         }
@@ -242,8 +304,21 @@ void ProbeFusedNumericSplit(LightGBM::NPURuntime* runtime) {
   for (const auto& handle : {wide_histogram, LightGBM::NPURuntime::HistogramHandle{}}) {
     auto best = runtime->FindBestSplit({wide}, wide_sum, 2.0, 2,
         0.0, 0.0, 1, 1e-3, 0.0, handle);
-    if (best.feature != 0 || best.threshold != 0 ||
-        best.right_gradient != 0.0 || best.right_output != 0.0) {
+    if (best.feature != 0 || best.threshold != 0) {
+      throw std::runtime_error("large-range split metadata differs from CPU");
+    }
+    if (simt && handle != nullptr) {
+      // The SIMT finder reports the scanned right prefix (FP32) instead of
+      // rebuilding it as `total - left`, which is CUDA's behaviour. The right
+      // gradient therefore keeps the 1.0 of the stored bin instead of being
+      // absorbed by the 1e16 total. Both sides still partition the leaf.
+      if (best.right_gradient != 1.0 ||
+          best.left_gradient != static_cast<double>(static_cast<float>(wide_sum))) {
+        throw std::runtime_error("SIMT right-statistic contract changed");
+      }
+      continue;
+    }
+    if (best.right_gradient != 0.0 || best.right_output != 0.0) {
       throw std::runtime_error("large-range right-statistic round trip differs from CPU");
     }
   }
@@ -280,7 +355,9 @@ int main(int argc, char** argv) {
       std::cout << "argmax=" << index << std::endl;
       if (index != 1) throw std::runtime_error("FP64 argmax first-tie mismatch");
     } else if (op == "fused_split") {
-      ProbeFusedNumericSplit(&runtime);
+      ProbeFusedNumericSplit(&runtime, false);
+    } else if (op == "fused_split_simt") {
+      ProbeFusedNumericSplit(&runtime, true);
     } else if (op == "split") {
       LightGBM::NPURuntime::SplitFeature feature;
       feature.feature = 0;

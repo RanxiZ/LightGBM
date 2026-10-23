@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <iomanip>
@@ -1549,14 +1550,25 @@ int main(int argc, char** argv) {
       for (auto& f : metadata) { f.gradients.clear(); f.hessians.clear(); }
       auto found = runtime.FindBestSplit(metadata, total.first, total.second,
                                          indices.size(), 0.2, 0.4, 3, 0.001, 0.0, device);
+      // The AI Core SIMT finder evaluates the split in FP32 (precision class
+      // P1) while this reference path accumulates in double. The selected
+      // split stays exact; only derived statistics may drift, and the gain is
+      // a difference of O(sum^2/hess) terms, so FP32 rounding is amplified to
+      // roughly 1e-5 relative. Union-disable the finder for bit-exact checks.
+      const bool simt_enabled = std::getenv("LGBM_NPU_DISABLE_SIMT_SPLIT") == nullptr;
+      const double stat_tolerance = simt_enabled ? 1e-4 : 1e-8;
+      auto close = [stat_tolerance](double a, double b) {
+        return std::fabs(a - b) <=
+               stat_tolerance * std::max(1.0, std::max(std::fabs(a), std::fabs(b)));
+      };
       if (found.feature != expected.feature || found.threshold != expected.threshold ||
           found.default_left != expected.default_left || found.splittable != expected.splittable ||
           found.left_count != expected.left_count || found.right_count != expected.right_count ||
-          std::fabs(found.gain - expected.gain) > 1e-8 ||
-          std::fabs(found.left_gradient - expected.left_gradient) > 1e-8 ||
-          std::fabs(found.left_hessian - expected.left_hessian) > 1e-8 ||
-          std::fabs(found.left_output - expected.left_output) > 1e-8 ||
-          std::fabs(found.right_output - expected.right_output) > 1e-8)
+          !close(found.gain, expected.gain) ||
+          !close(found.left_gradient, expected.left_gradient) ||
+          !close(found.left_hessian, expected.left_hessian) ||
+          !close(found.left_output, expected.left_output) ||
+          !close(found.right_output, expected.right_output))
         throw std::runtime_error("resident split differs from host histogram input");
     };
     verify(parent, all);

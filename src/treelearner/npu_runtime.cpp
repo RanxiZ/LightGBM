@@ -2,6 +2,7 @@
 #include "npu_runtime.h"
 #include "npu_fused_split.h"
 #include "npu_fused_histogram.h"
+#include "npu_simt_split_op.h"
 #include "simt_fixed_point.h"
 
 #include <LightGBM/utils/log.h>
@@ -68,7 +69,11 @@ namespace {
 constexpr int kSimtFeaturesPerBlock = 4;
 constexpr int kSimtMaxGrid = 65535;
 constexpr int64_t kSimtRowsPerChunk = 8192;  // bounds the per-block flush cost
-constexpr int kSimtTargetBlocks = 512;       // total blocks across both axes
+// Mirrors the v2 runtime's kTargetBlocks. The kernel is latency bound on the
+// dependent row->bin->gradient gather chain rather than occupancy bound, and
+// 112 total blocks also folds small leaves onto a single row chunk
+// (row_chunks == 1), which is the condition for the fused single-launch path.
+constexpr int kSimtTargetBlocks = 112;       // total blocks across both axes
 constexpr int kSimtMaxRowChunks = 4096;
 
 int SelectKernelStride(int histogram_stride) {
@@ -265,6 +270,12 @@ struct NPURuntime::DeviceHistogram {
   int features = 0, stride = 0;
   std::vector<int8_t> used;
   bool fixed = false;
+  // FP32 view of `values` for the AI Core SIMT best-split finder (precision
+  // contract P1): [gradient plane, hessian plane], produced once per build by
+  // one device-side cast, so a leaf that runs several split calls never
+  // round-trips the histogram through the host.
+  DeviceBuffer simt_planes;
+  bool simt_ready = false;
 };
 
 struct NPURuntime::QuantizedDeviceHistogram {
@@ -321,6 +332,17 @@ struct NPURuntime::Impl {
   std::vector<DeviceBuffer> histogram_tiles;
   DeviceBuffer histogram_tile_pointers;
   DeviceBuffer histogram_gradients, histogram_hessians;
+  // Row-interleaved {gradient, Hessian} pairs for the AI Core SIMT v2 kernel:
+  // pairs[2r] = gradient(r), pairs[2r+1] = Hessian(r). The kernel's row loop
+  // gathers a random row per lane, so reading both planes from one cache line
+  // halves the scattered requests on that dependency chain. Staged once per
+  // gradient update (i.e. outside the timed histogram build); values are copied
+  // verbatim, so the arithmetic is bit-identical to the split-plane form.
+  // `histogram_gradients` / `histogram_hessians` stay resident because the ACL
+  // fallback (LGBM_NPU_DISABLE_FUSED_HISTOGRAM) reads them in their original
+  // split-plane layout.
+  DeviceBuffer histogram_pairs;         // float[2*rows]
+  std::vector<float> histogram_pair_staging;
   // --- AI Core SIMT fused histogram (v2) dataset-lifetime state -----------
   // row_bins is a dense [row][feature] int32 matrix of *stored* bin indices
   // (bin - offset) with -1 for omitted / out-of-range bins, matching the v2
@@ -344,6 +366,11 @@ struct NPURuntime::Impl {
   bool quantized_ready = false;
   DeviceBuffer partition_positions;
   DeviceBuffer workspace;
+  // AI Core SIMT best-split finder. Attached to this runtime's own context and
+  // stream, so no second ACL context exists and teardown never resets the
+  // device. Created on first use.
+  std::unique_ptr<lgbm_npu_simt::SimtSplitOperator> simt_split;
+  bool simt_split_failed = false;
 
   struct ScoreBuffer {
     int64_t num_data = 0;
@@ -440,6 +467,9 @@ NPURuntime::~NPURuntime() {
   impl_->histogram_tiles.clear();
   impl_->histogram_gradients = DeviceBuffer();
   impl_->histogram_hessians = DeviceBuffer();
+  impl_->histogram_pairs = DeviceBuffer();
+  impl_->histogram_pair_staging.clear();
+  impl_->histogram_pair_staging.shrink_to_fit();
   impl_->histogram_row_bins = DeviceBuffer();
   impl_->histogram_stored_bins = DeviceBuffer();
   impl_->simt_feature_index = DeviceBuffer();
@@ -452,6 +482,9 @@ NPURuntime::~NPURuntime() {
   impl_->quantized_ready = false;
   impl_->partition_positions = DeviceBuffer();
   impl_->workspace = DeviceBuffer();
+  // The SIMT split finder only borrows this runtime's context/stream, but its
+  // device buffers must be freed while the context is still alive.
+  impl_->simt_split.reset();
   if (impl_->stream != nullptr) {
     aclrtDestroyStream(impl_->stream);
   }
@@ -476,6 +509,9 @@ void NPURuntime::SetHistogramBins(const std::vector<std::vector<uint32_t>>& bins
   impl_->histogram_tiles.clear();
   impl_->histogram_gradients = DeviceBuffer();
   impl_->histogram_hessians = DeviceBuffer();
+  impl_->histogram_pairs = DeviceBuffer();
+  impl_->histogram_pair_staging.clear();
+  impl_->histogram_pair_staging.shrink_to_fit();
   impl_->histogram_row_bins = DeviceBuffer();
   impl_->histogram_stored_bins = DeviceBuffer();
   impl_->simt_metadata_used.clear();
@@ -585,6 +621,22 @@ void NPURuntime::SetHistogramGradients(const float* gradients, const float* hess
                         ACL_MEMCPY_HOST_TO_DEVICE));
   ACL_CHECK(aclrtMemcpy(impl_->histogram_hessians.data(), bytes, hessians, bytes,
                         ACL_MEMCPY_HOST_TO_DEVICE));
+  // Row-interleaved copy for the v2 kernel (gradients == nullptr there, so the
+  // hessian pointer is unused). Pure re-layout: every value is bit-identical.
+  const size_t pair_bytes = 2 * bytes;
+  if (impl_->histogram_pairs.bytes() != pair_bytes) {
+    impl_->histogram_pairs = DeviceBuffer(pair_bytes);
+  }
+  impl_->histogram_pair_staging.resize(static_cast<size_t>(2 * num_data));
+  for (int64_t row = 0; row < num_data; ++row) {
+    impl_->histogram_pair_staging[static_cast<size_t>(2 * row)] = gradients[row];
+    impl_->histogram_pair_staging[static_cast<size_t>(2 * row) + 1] = hessians[row];
+  }
+  if (pair_bytes != 0) {
+    ACL_CHECK(aclrtMemcpy(impl_->histogram_pairs.data(), pair_bytes,
+                          impl_->histogram_pair_staging.data(), pair_bytes,
+                          ACL_MEMCPY_HOST_TO_DEVICE));
+  }
 }
 
 NPURuntime::HistogramHandle NPURuntime::BuildHistogram(
@@ -616,14 +668,20 @@ NPURuntime::HistogramHandle NPURuntime::BuildHistogramFromDeviceRows(
   ++histogram_calls_;
   if (count == 0 || used.empty()) return result;
   CHECK(device_row_indices != nullptr);
-  // Default to the AI Core SIMT fused path: two dependent device launches
-  // (scan, then histogram+finalize) replace the gather/expand/cast/scatter
-  // chains. Set LGBM_NPU_DISABLE_FUSED_HISTOGRAM to retain the ACL operator
-  // path, which remains the fallback for comparison and debugging.
+  // Default to the AI Core SIMT fused path. One device launch replaces the
+  // gather/expand/cast/scatter chains: when the whole leaf fits in one row
+  // chunk per feature partition (row_chunks == 1) the scan and histogram passes
+  // merge into v2_fused_kernel, otherwise they run as two dependent launches
+  // (scan, then histogram+finalize). Set LGBM_NPU_DISABLE_FUSED_HISTOGRAM to
+  // retain the ACL operator path, which remains the fallback for comparison and
+  // debugging.
   if (std::getenv("LGBM_NPU_DISABLE_FUSED_HISTOGRAM") == nullptr) {
     CHECK(impl_->histogram_row_bins.data() != nullptr);
     CHECK(impl_->histogram_gradients.data() != nullptr);
     CHECK(impl_->histogram_hessians.data() != nullptr);
+    // The v2 kernel reads the row-interleaved (grad, hess) pairs through the
+    // `gradients` pointer and never touches `hessians`.
+    CHECK(impl_->histogram_pairs.data() != nullptr);
     impl_->EnsureSimtMetadata(used);
     if (impl_->simt_num_used == 0) return result;
     const int row_chunks = PlanRowChunks(count, impl_->simt_partitions);
@@ -634,8 +692,8 @@ NPURuntime::HistogramHandle NPURuntime::BuildHistogramFromDeviceRows(
         impl_->stream,
         static_cast<const int32_t*>(impl_->histogram_row_bins.data()),
         device_row_indices,
-        static_cast<const float*>(impl_->histogram_gradients.data()),
-        static_cast<const float*>(impl_->histogram_hessians.data()),
+        static_cast<const float*>(impl_->histogram_pairs.data()),
+        nullptr,  // gradients carries the row-interleaved (grad, hess) pairs
         static_cast<const int32_t*>(impl_->simt_feature_index.data()),
         static_cast<const int32_t*>(impl_->histogram_stored_bins.data()),
         static_cast<uint32_t*>(impl_->simt_bin_max.data()),
@@ -2007,6 +2065,9 @@ void NPURuntime::FixHistogram(const HistogramHandle& histogram,
     }
   }
   histogram->fixed = true;
+  // `values` was patched in place; the FP32 SIMT mirror is stale from here on.
+  histogram->simt_ready = false;
+  histogram->simt_planes = DeviceBuffer();
 }
 
 void NPURuntime::SubtractHistogram(const HistogramHandle& parent,
@@ -2028,6 +2089,10 @@ void NPURuntime::SubtractHistogram(const HistogramHandle& parent,
   }, aclnnSub);
   parent->values = std::move(difference);
   parent->used = smaller->used;
+  // The FP32 SIMT planes mirror `values`; drop them so the next split call
+  // rebuilds from the subtracted histogram.
+  parent->simt_ready = false;
+  parent->simt_planes = DeviceBuffer();
 }
 
 void NPURuntime::Histogram(const std::vector<int64_t>& indices,
@@ -2428,6 +2493,240 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
       }
       packed.push_back(metadata);
     }
+
+    // -----------------------------------------------------------------------
+    // AI Core SIMT best-split finder.
+    //
+    // Same task list and the same RNG draws as the AI CPU kernel below (every
+    // draw already happened above, so falling back cannot change the sequence),
+    // but the scan and merge run as SIMT warps on the vector cores under
+    // precision contract P1 (FP32).
+    //
+    // Items the SIMT ABI does not model fall back to the AI CPU kernel:
+    //   * max_delta_step > 0   - no field in SimtSplitParams;
+    //   * penalty != 1.0       - the candidate gain carries no penalty;
+    //   * mixed randomized / exhaustive features in one leaf - `use_rand` is a
+    //     launch-wide selector, so a task without a drawn threshold would be
+    //     rejected by the kernel;
+    //   * extra_trees on a feature with both `GetMostFreqBin() == 0` (offset 1)
+    //     and MissingType::NaN: CUDA's "special" forward pass compares the draw
+    //     against `threadIdx_x + mfb_offset` but emits `threadIdx_x` as the
+    //     threshold, so its gate is one off from the threshold the AI CPU
+    //     scanner (and this runtime's RNG contract) uses.
+    bool simt_penalty_supported = true;
+    bool simt_randomized = false, simt_exhaustive = false;
+    bool simt_random_gate_diverges = false;
+    for (const auto& metadata : packed) {
+      if (metadata.penalty != 1.0) simt_penalty_supported = false;
+      if (metadata.num_bin <= 1) continue;
+      if (metadata.randomized) {
+        simt_randomized = true;
+        if (metadata.num_bin > 2 && metadata.missing_type == 2 &&
+            metadata.offset == 1) {
+          simt_random_gate_diverges = true;
+        }
+      } else {
+        simt_exhaustive = true;
+      }
+    }
+    if (!impl_->simt_split_failed && max_delta_step <= 0.0 &&
+        simt_penalty_supported && !simt_random_gate_diverges &&
+        !(simt_randomized && simt_exhaustive) &&
+        std::getenv("LGBM_NPU_DISABLE_SIMT_SPLIT") == nullptr) {
+      if (impl_->simt_split == nullptr) {
+        std::unique_ptr<lgbm_npu_simt::SimtSplitOperator> candidate_operator(
+            new lgbm_npu_simt::SimtSplitOperator());
+        if (candidate_operator->Attach(impl_->device, impl_->context,
+                                       impl_->stream) ==
+            lgbm_npu_simt::kSimtSplitOk) {
+          Log::Info("NPU fused split: AI Core SIMT finder attached (%d vector cores)",
+                    candidate_operator->vector_cores());
+          impl_->simt_split = std::move(candidate_operator);
+        } else {
+          Log::Warning(
+              "NPU fused split: AI Core SIMT finder unavailable (%s); using the "
+              "AI CPU kernel",
+              candidate_operator->last_error());
+          impl_->simt_split_failed = true;
+        }
+      }
+      if (impl_->simt_split != nullptr) {
+        const int64_t plane =
+            static_cast<int64_t>(histogram->features) * histogram->stride;
+        if (!histogram->simt_ready) {
+          // Both planes are contiguous in `values`, so one cast converts the
+          // whole resident histogram. This is a device operator, not a host
+          // round trip, and runs once per histogram build.
+          const int64_t elements = 2 * plane;
+          histogram->simt_planes =
+              DeviceBuffer(static_cast<size_t>(elements) * sizeof(float));
+          TensorHandle simt_source(histogram->values.data(), {elements},
+                                   ACL_DOUBLE);
+          TensorHandle simt_target(histogram->simt_planes.data(), {elements},
+                                   ACL_FLOAT);
+          impl_->Launch(
+              [&](uint64_t* workspace_size, aclOpExecutor** executor) {
+                return aclnnCastGetWorkspaceSize(simt_source.get(), ACL_FLOAT,
+                                                 simt_target.get(), workspace_size,
+                                                 executor);
+              },
+              aclnnCast);
+          histogram->simt_ready = true;
+        }
+        const float* simt_gradients =
+            static_cast<const float*>(histogram->simt_planes.data());
+        const float* simt_hessians = simt_gradients + plane;
+
+        // Task construction mirrors CUDA `InitCUDAFeatureMetaInfo`:
+        // double_scan features (num_bin > 2 with missing values) get a forward
+        // task then a reverse task; everything else gets a single reverse task.
+        std::vector<lgbm_npu_simt::SimtSplitTask> simt_tasks;
+        simt_tasks.reserve(packed.size() * 2);
+        for (const auto& metadata : packed) {
+          if (metadata.num_bin <= 1) continue;
+          const bool double_scan =
+              metadata.num_bin > 2 && metadata.missing_type != 0;
+          lgbm_npu_simt::SimtSplitTask task = {};
+          task.inner_feature_index = metadata.feature;
+          task.input_index = metadata.input_index;
+          task.hist_offset = static_cast<int64_t>(metadata.histogram_index) *
+                             static_cast<int64_t>(histogram->stride);
+          task.bin_stride = 1;
+          task.num_bin = static_cast<uint32_t>(metadata.num_bin);
+          task.default_bin = static_cast<uint32_t>(metadata.default_bin);
+          task.mfb_offset = static_cast<uint32_t>(metadata.offset);
+          task.is_categorical = 0;
+          task.rand_threshold =
+              metadata.randomized ? metadata.random_threshold : -1;
+          if (double_scan) {
+            task.reverse = 0;
+            task.skip_default_bin = metadata.missing_type == 1 ? 1u : 0u;
+            task.na_as_missing = metadata.missing_type == 2 ? 1u : 0u;
+            task.assume_out_default_left = 0;
+            simt_tasks.push_back(task);
+            task.reverse = 1;
+            task.assume_out_default_left = 1;
+            simt_tasks.push_back(task);
+          } else {
+            task.reverse = 1;
+            task.skip_default_bin = 0;
+            task.na_as_missing = 0;
+            task.assume_out_default_left = metadata.missing_type != 2 ? 1u : 0u;
+            simt_tasks.push_back(task);
+          }
+        }
+
+        if (!simt_tasks.empty()) {
+          // `sum_hessians` is LightGBM's `total_hessian`, and `parent_gain` the
+          // same shifted parent gain the AI CPU kernel computes, so both
+          // paths evaluate `gain - min_gain_shift` identically.
+          const double total_hessian = sum_hessian + 2.0 * kEpsilon;
+          lgbm_npu_simt::SimtSplitParams simt_parameters = {};
+          simt_parameters.num_data = num_data;
+          simt_parameters.num_features = static_cast<int32_t>(features.size());
+          simt_parameters.sum_gradients = static_cast<float>(sum_gradient);
+          simt_parameters.sum_hessians = static_cast<float>(total_hessian);
+          simt_parameters.parent_gain = static_cast<float>(CategoricalLeafGain(
+              sum_gradient, total_hessian, lambda_l1, lambda_l2, max_delta_step,
+              path_smooth, num_data, parent_output));
+          simt_parameters.min_sum_hessian_in_leaf =
+              static_cast<float>(min_sum_hessian_in_leaf);
+          simt_parameters.min_gain_to_split =
+              static_cast<float>(min_gain_to_split);
+          simt_parameters.lambda_l1 = static_cast<float>(lambda_l1);
+          simt_parameters.lambda_l2 = static_cast<float>(lambda_l2);
+          simt_parameters.path_smooth = static_cast<float>(path_smooth);
+          simt_parameters.parent_output = static_cast<float>(parent_output);
+          simt_parameters.min_data_in_leaf = min_data_in_leaf;
+          simt_parameters.use_l1 = lambda_l1 > 0.0 ? 1 : 0;
+          simt_parameters.use_smoothing = path_smooth > 0.0 ? 1 : 0;
+          simt_parameters.use_rand = simt_randomized ? 1 : 0;
+
+          lgbm_npu_simt::SimtSplitWinner simt_winner = {};
+          std::vector<lgbm_npu_simt::SimtSplitCandidate> simt_candidates(
+              simt_tasks.size());
+          int32_t simt_status = impl_->simt_split->UploadTasks(
+              simt_tasks.data(), static_cast<int32_t>(simt_tasks.size()),
+              simt_parameters);
+          if (simt_status == lgbm_npu_simt::kSimtSplitOk) {
+            simt_status = impl_->simt_split->BindDeviceHistogram(
+                simt_gradients, simt_hessians, plane);
+          }
+          if (simt_status == lgbm_npu_simt::kSimtSplitOk) {
+            simt_status = impl_->simt_split->RunPrepared(&simt_winner);
+          }
+          if (simt_status == lgbm_npu_simt::kSimtSplitOk) {
+            simt_status = impl_->simt_split->DownloadCandidates(
+                simt_candidates.data(),
+                static_cast<int32_t>(simt_candidates.size()));
+          }
+          if (simt_status != lgbm_npu_simt::kSimtSplitOk) {
+            Log::Warning(
+                "NPU fused split: AI Core SIMT finder failed (%s); falling back "
+                "to the AI CPU kernel for the rest of training",
+                impl_->simt_split->last_error());
+            impl_->simt_split.reset();
+            impl_->simt_split_failed = true;
+          } else {
+            // `splittable` is the OR over a feature's tasks, as in the AI CPU
+            // kernel, and deliberately includes node-disabled features: the
+            // tree learner consumes it for every feature of the node.
+            for (const auto& candidate : simt_candidates) {
+              if (candidate.is_valid != 0) {
+                result.splittable[static_cast<size_t>(candidate.input_index)] = 1;
+              }
+            }
+            // The device merge already applies "first maximum gain in task
+            // order", but it cannot see `enabled`; redo the merge on the host
+            // when the device winner belongs to a disabled feature.
+            int32_t best_task = -1;
+            if (simt_winner.is_valid != 0 &&
+                features[static_cast<size_t>(simt_winner.input_index)].enabled) {
+              best_task = static_cast<int32_t>(simt_winner.task_index);
+            } else {
+              for (size_t task_index = 0; task_index < simt_candidates.size();
+                   ++task_index) {
+                const auto& candidate = simt_candidates[task_index];
+                if (candidate.is_valid == 0) continue;
+                if (!features[static_cast<size_t>(candidate.input_index)].enabled) {
+                  continue;
+                }
+                if (best_task < 0 ||
+                    candidate.gain > simt_candidates[best_task].gain) {
+                  best_task = static_cast<int32_t>(task_index);
+                }
+              }
+            }
+            ++argmax_calls_;
+            if (best_task >= 0) {
+              const auto& winner = simt_candidates[static_cast<size_t>(best_task)];
+              if (!std::isfinite(winner.gain)) {
+                Log::Fatal("NPU SIMT split produced a nonfinite winning gain");
+              }
+              result.feature = static_cast<int>(winner.inner_feature_index);
+              result.threshold = winner.threshold;
+              result.default_left = winner.assume_out_default_left != 0;
+              result.gain = static_cast<double>(winner.gain);
+              result.left_output = static_cast<double>(winner.left_value);
+              result.right_output = static_cast<double>(winner.right_value);
+              result.left_gradient =
+                  static_cast<double>(winner.left_sum_gradients);
+              result.right_gradient =
+                  static_cast<double>(winner.right_sum_gradients);
+              // Contract P1 keeps the epsilon round trip inside the kernel.
+              result.left_hessian =
+                  static_cast<double>(winner.left_sum_hessians);
+              result.right_hessian =
+                  static_cast<double>(winner.right_sum_hessians);
+              result.left_count = winner.left_count;
+              result.right_count = winner.right_count;
+            }
+            return result;
+          }
+        }
+      }
+    }
+
     LGBMNPUFusedSplitParameters parameters = {};
     parameters.histogram_plane = static_cast<int64_t>(histogram->features) * histogram->stride;
     parameters.histogram_stride = histogram->stride;
