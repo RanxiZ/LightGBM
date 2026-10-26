@@ -27,6 +27,7 @@
 #include <aclnnop/aclnn_logical_not.h>
 #include <aclnnop/aclnn_any.h>
 #include <aclnnop/aclnn_masked_fill_scalar.h>
+#include <aclnnop/aclnn_index_copy.h>
 #include <aclnnop/aclnn_index_select.h>
 #include <aclnnop/aclnn_maximum.h>
 #include <aclnnop/aclnn_mul.h>
@@ -270,12 +271,6 @@ struct NPURuntime::DeviceHistogram {
   int features = 0, stride = 0;
   std::vector<int8_t> used;
   bool fixed = false;
-  // FP32 view of `values` for the AI Core SIMT best-split finder (precision
-  // contract P1): [gradient plane, hessian plane], produced once per build by
-  // one device-side cast, so a leaf that runs several split calls never
-  // round-trips the histogram through the host.
-  DeviceBuffer simt_planes;
-  bool simt_ready = false;
 };
 
 struct NPURuntime::QuantizedDeviceHistogram {
@@ -366,6 +361,24 @@ struct NPURuntime::Impl {
   bool quantized_ready = false;
   DeviceBuffer partition_positions;
   DeviceBuffer workspace;
+  // --- per-leaf histogram post-processing scratch -------------------------
+  // FixHistogram and SubtractHistogram run several element-wise operators on
+  // the same 2 x features x stride plane. Their intermediates are kept here
+  // instead of being allocated per leaf, and the operators are enqueued
+  // without a host round trip: everything below is stream-ordered and is only
+  // touched between two host synchronisations, so the next consumer (the
+  // split finder's winner download) is what waits.
+  DeviceBuffer fix_prefix;        // FP64[2 * features * stride]
+  DeviceBuffer fix_sums;          // FP64[fixes]
+  DeviceBuffer fix_residuals;     // FP64[fixes]
+  DeviceBuffer fix_parents;       // FP64[fixes]
+  DeviceBuffer fix_last_indices;  // INT64[fixes]
+  DeviceBuffer fix_destinations;  // INT64[fixes]
+  DeviceBuffer subtract_buffer;   // FP64[2 * features * stride]
+  // FP32 view of a fixed histogram for the AI Core SIMT split finder. One
+  // plane is enough because the finder consumes it before the next leaf is
+  // converted; the histogram handle therefore no longer owns a mirror.
+  DeviceBuffer simt_plane_scratch;  // FP32[2 * features * stride]
   // AI Core SIMT best-split finder. Attached to this runtime's own context and
   // stream, so no second ACL context exists and teardown never resets the
   // device. Created on first use.
@@ -381,16 +394,45 @@ struct NPURuntime::Impl {
   // identity of a LightGBM score slice (including a multiclass slice).
   std::map<const double*, ScoreBuffer> score_buffers;
 
-  // Reuse the largest workspace across launches. Each launch is still
-  // synchronized until all temporary tensors have stream-ordered lifetimes.
+  // Reuse the largest workspace across launches.
+  //
+  // `Launch` waits for the operator (the historical behaviour, required when
+  // the caller frees a temporary tensor or reads a host pointer right after).
+  // `LaunchAsync` only enqueues; it is for chains whose inputs and outputs are
+  // persistent, stream-ordered buffers, where the next host synchronisation is
+  // the download of the round's result.
   template <typename SizeFn, typename RunFn>
-  void Launch(SizeFn size_fn, RunFn run_fn) {
+  void LaunchAsync(SizeFn size_fn, RunFn run_fn) {
     uint64_t workspace_size = 0;
     aclOpExecutor* executor = nullptr;
     ACL_CHECK(size_fn(&workspace_size, &executor));
-    if (workspace.bytes() < workspace_size) workspace = DeviceBuffer(workspace_size);
+    if (workspace.bytes() < workspace_size) {
+      // A queued operator may still be reading the current workspace; drain
+      // before replacing it. Growing is a one-off per workload.
+      ACL_CHECK(aclrtSynchronizeStream(stream));
+      workspace = DeviceBuffer(workspace_size);
+    }
     ACL_CHECK(run_fn(workspace.data(), workspace_size, executor, stream));
+  }
+
+  template <typename SizeFn, typename RunFn>
+  void Launch(SizeFn size_fn, RunFn run_fn) {
+    LaunchAsync(size_fn, run_fn);
     ACL_CHECK(aclrtSynchronizeStream(stream));
+  }
+
+  // Grow-only scratch reuse. Buffers are freed on a dataset change or at
+  // teardown, both of which happen with the stream drained.
+  static void Reserve(DeviceBuffer* buffer, size_t bytes) {
+    if (buffer->bytes() < bytes) *buffer = DeviceBuffer(bytes);
+  }
+
+  // Copy into an existing device buffer (no allocation).
+  void UploadInto(const DeviceBuffer& buffer, const void* host, size_t bytes) {
+    if (bytes == 0) return;
+    CHECK_GE(buffer.bytes(), bytes);
+    ACL_CHECK(aclrtMemcpy(buffer.data(), bytes, host, bytes,
+                          ACL_MEMCPY_HOST_TO_DEVICE));
   }
 
   DeviceBuffer Upload(const void* host, size_t bytes) {
@@ -461,6 +503,11 @@ NPURuntime::NPURuntime(int device) : impl_(new Impl) {
 NPURuntime::~NPURuntime() {
   // Resident allocations must be freed while their device context is alive.
   aclrtSetCurrentContext(impl_->context);
+  // The fix/subtract chain is enqueued without per-operator waits, so make
+  // sure nothing is still reading a resident buffer before it is released.
+  if (impl_->stream != nullptr) {
+    aclrtSynchronizeStream(impl_->stream);
+  }
   // Resident score buffers must be released while the context is current.
   impl_->score_buffers.clear();
   impl_->histogram_tile_pointers = DeviceBuffer();
@@ -482,6 +529,14 @@ NPURuntime::~NPURuntime() {
   impl_->quantized_ready = false;
   impl_->partition_positions = DeviceBuffer();
   impl_->workspace = DeviceBuffer();
+  impl_->fix_prefix = DeviceBuffer();
+  impl_->fix_sums = DeviceBuffer();
+  impl_->fix_residuals = DeviceBuffer();
+  impl_->fix_parents = DeviceBuffer();
+  impl_->fix_last_indices = DeviceBuffer();
+  impl_->fix_destinations = DeviceBuffer();
+  impl_->subtract_buffer = DeviceBuffer();
+  impl_->simt_plane_scratch = DeviceBuffer();
   // The SIMT split finder only borrows this runtime's context/stream, but its
   // device buffers must be freed while the context is still alive.
   impl_->simt_split.reset();
@@ -2000,6 +2055,9 @@ NPURuntime::HistogramResult NPURuntime::ReadHistogram(const HistogramHandle& his
   result.hessians.resize(histogram->features);
   const size_t value_count = histogram->values.bytes() / sizeof(double);
   std::vector<double> host(value_count);
+  // The fix/subtract chain is enqueued without waiting, so a host readback has
+  // to drain the stream first.
+  ACL_CHECK(aclrtSynchronizeStream(impl_->stream));
   impl_->Download(host.data(), histogram->values, histogram->values.bytes());
   const int64_t plane = static_cast<int64_t>(histogram->features) * histogram->stride;
   for (int feature = 0; feature < histogram->features; ++feature) {
@@ -2039,35 +2097,57 @@ void NPURuntime::FixHistogram(const HistogramHandle& histogram,
   }
   const int64_t fixes = static_cast<int64_t>(last_indices.size());
   if (fixes != 0) {
-    DeviceBuffer prefix(elements * sizeof(double));
+    const size_t fix_bytes = static_cast<size_t>(fixes) * sizeof(double);
+    const size_t index_bytes = static_cast<size_t>(fixes) * sizeof(int64_t);
+    // Persistent, stream-ordered scratch: no allocation per leaf, and the
+    // operator chain is enqueued without waiting between the four steps. The
+    // next host synchronisation is the split finder's winner download.
+    Impl::Reserve(&impl_->fix_prefix, static_cast<size_t>(elements) * sizeof(double));
+    Impl::Reserve(&impl_->fix_last_indices, index_bytes);
+    Impl::Reserve(&impl_->fix_destinations, index_bytes);
+    Impl::Reserve(&impl_->fix_sums, fix_bytes);
+    Impl::Reserve(&impl_->fix_parents, fix_bytes);
+    Impl::Reserve(&impl_->fix_residuals, fix_bytes);
+    impl_->UploadInto(impl_->fix_last_indices, last_indices.data(), index_bytes);
+    impl_->UploadInto(impl_->fix_destinations, destinations.data(), index_bytes);
+    impl_->UploadInto(impl_->fix_parents, totals.data(), fix_bytes);
     TensorHandle input(histogram->values.data(), {2 * histogram->features, histogram->stride}, ACL_DOUBLE);
-    TensorHandle output(prefix.data(), {2 * histogram->features, histogram->stride}, ACL_DOUBLE);
-    impl_->Launch([&](uint64_t* s, aclOpExecutor** e) {
+    TensorHandle output(impl_->fix_prefix.data(), {2 * histogram->features, histogram->stride}, ACL_DOUBLE);
+    impl_->LaunchAsync([&](uint64_t* s, aclOpExecutor** e) {
       return aclnnCumsumGetWorkspaceSize(input.get(), 1, ACL_DOUBLE, output.get(), s, e);
     }, aclnnCumsum);
-    DeviceBuffer indices = impl_->Upload(last_indices.data(), fixes * sizeof(int64_t));
-    DeviceBuffer sums(fixes * sizeof(double));
-    DeviceBuffer parents = impl_->Upload(totals.data(), fixes * sizeof(double));
-    DeviceBuffer residuals(fixes * sizeof(double));
-    TensorHandle flat(prefix.data(), {elements}, ACL_DOUBLE);
-    TensorHandle index(indices.data(), {fixes}, ACL_INT64), sum(sums.data(), {fixes}, ACL_DOUBLE);
-    TensorHandle parent(parents.data(), {fixes}, ACL_DOUBLE), residual(residuals.data(), {fixes}, ACL_DOUBLE);
-    impl_->Launch([&](uint64_t* s, aclOpExecutor** e) {
+    TensorHandle flat(impl_->fix_prefix.data(), {elements}, ACL_DOUBLE);
+    TensorHandle index(impl_->fix_last_indices.data(), {fixes}, ACL_INT64);
+    TensorHandle sum(impl_->fix_sums.data(), {fixes}, ACL_DOUBLE);
+    TensorHandle parent(impl_->fix_parents.data(), {fixes}, ACL_DOUBLE);
+    TensorHandle residual(impl_->fix_residuals.data(), {fixes}, ACL_DOUBLE);
+    impl_->LaunchAsync([&](uint64_t* s, aclOpExecutor** e) {
       return aclnnIndexSelectGetWorkspaceSize(flat.get(), 0, index.get(), sum.get(), s, e);
     }, aclnnIndexSelect);
     ScalarHandle one(1.0, ACL_DOUBLE);
-    impl_->Launch([&](uint64_t* s, aclOpExecutor** e) {
+    impl_->LaunchAsync([&](uint64_t* s, aclOpExecutor** e) {
       return aclnnSubGetWorkspaceSize(parent.get(), sum.get(), one.get(), residual.get(), s, e);
     }, aclnnSub);
-    for (int64_t i = 0; i < fixes; ++i) {
-      ACL_CHECK(aclrtMemcpy(static_cast<double*>(histogram->values.data()) + destinations[i], sizeof(double),
-                            static_cast<double*>(residuals.data()) + i, sizeof(double), ACL_MEMCPY_DEVICE_TO_DEVICE));
+    // Apply all per-feature most-frequent-bin residuals with one in-place
+    // scatter instead of `fixes` (2 x features) synchronous 8-byte D2D
+    // copies. Destinations are unique, so the write order is irrelevant and
+    // the result is bit-identical.
+    if (std::getenv("LGBM_NPU_DISABLE_INDEXCOPY_FIX") == nullptr) {
+      TensorHandle dest_index(impl_->fix_destinations.data(), {fixes}, ACL_INT64);
+      TensorHandle values_flat(histogram->values.data(), {elements}, ACL_DOUBLE);
+      impl_->LaunchAsync([&](uint64_t* s, aclOpExecutor** e) {
+        return aclnnInplaceIndexCopyGetWorkspaceSize(values_flat.get(), 0, dest_index.get(),
+                                                     residual.get(), s, e);
+      }, aclnnInplaceIndexCopy);
+    } else {
+      ACL_CHECK(aclrtSynchronizeStream(impl_->stream));
+      for (int64_t i = 0; i < fixes; ++i) {
+        ACL_CHECK(aclrtMemcpy(static_cast<double*>(histogram->values.data()) + destinations[i], sizeof(double),
+                              static_cast<double*>(impl_->fix_residuals.data()) + i, sizeof(double), ACL_MEMCPY_DEVICE_TO_DEVICE));
+      }
     }
   }
   histogram->fixed = true;
-  // `values` was patched in place; the FP32 SIMT mirror is stale from here on.
-  histogram->simt_ready = false;
-  histogram->simt_planes = DeviceBuffer();
 }
 
 void NPURuntime::SubtractHistogram(const HistogramHandle& parent,
@@ -2078,21 +2158,24 @@ void NPURuntime::SubtractHistogram(const HistogramHandle& parent,
   CHECK_EQ(parent->features, smaller->features);
   CHECK_EQ(parent->stride, smaller->stride);
   ACL_CHECK(aclrtSetCurrentContext(impl_->context));
-  DeviceBuffer difference(parent->values.bytes());
-  const int64_t elements = static_cast<int64_t>(parent->values.bytes() / sizeof(double));
-  TensorHandle a(parent->values.data(), {elements}, ACL_DOUBLE);
+  const size_t bytes = parent->values.bytes();
+  const int64_t elements = static_cast<int64_t>(bytes / sizeof(double));
+  Impl::Reserve(&impl_->subtract_buffer, bytes);
+  // `parent` is dead after this call, so its buffer becomes the destination of
+  // the next subtraction: the swap keeps one FP64 plane alive instead of
+  // allocating and freeing one per leaf. The subtraction itself is enqueued
+  // without a host round trip.
+  DeviceBuffer previous = std::move(parent->values);
+  TensorHandle a(previous.data(), {elements}, ACL_DOUBLE);
   TensorHandle b(smaller->values.data(), {elements}, ACL_DOUBLE);
-  TensorHandle out(difference.data(), {elements}, ACL_DOUBLE);
+  TensorHandle out(impl_->subtract_buffer.data(), {elements}, ACL_DOUBLE);
   ScalarHandle one(1.0, ACL_DOUBLE);
-  impl_->Launch([&](uint64_t* s, aclOpExecutor** e) {
+  impl_->LaunchAsync([&](uint64_t* s, aclOpExecutor** e) {
     return aclnnSubGetWorkspaceSize(a.get(), b.get(), one.get(), out.get(), s, e);
   }, aclnnSub);
-  parent->values = std::move(difference);
+  parent->values = std::move(impl_->subtract_buffer);
+  impl_->subtract_buffer = std::move(previous);
   parent->used = smaller->used;
-  // The FP32 SIMT planes mirror `values`; drop them so the next split call
-  // rebuilds from the subtracted histogram.
-  parent->simt_ready = false;
-  parent->simt_planes = DeviceBuffer();
 }
 
 void NPURuntime::Histogram(const std::vector<int64_t>& indices,
@@ -2553,28 +2636,26 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
       if (impl_->simt_split != nullptr) {
         const int64_t plane =
             static_cast<int64_t>(histogram->features) * histogram->stride;
-        if (!histogram->simt_ready) {
-          // Both planes are contiguous in `values`, so one cast converts the
-          // whole resident histogram. This is a device operator, not a host
-          // round trip, and runs once per histogram build.
-          const int64_t elements = 2 * plane;
-          histogram->simt_planes =
-              DeviceBuffer(static_cast<size_t>(elements) * sizeof(float));
-          TensorHandle simt_source(histogram->values.data(), {elements},
-                                   ACL_DOUBLE);
-          TensorHandle simt_target(histogram->simt_planes.data(), {elements},
-                                   ACL_FLOAT);
-          impl_->Launch(
-              [&](uint64_t* workspace_size, aclOpExecutor** executor) {
-                return aclnnCastGetWorkspaceSize(simt_source.get(), ACL_FLOAT,
-                                                 simt_target.get(), workspace_size,
-                                                 executor);
-              },
-              aclnnCast);
-          histogram->simt_ready = true;
-        }
+        // Both planes are contiguous in `values` and the histogram was fixed
+        // or subtracted earlier in this round, so the FP32 mirror is always
+        // rebuilt here. One cast, enqueued on the stream; the split finder's
+        // own synchronisation is what waits for it.
+        const int64_t elements = 2 * plane;
+        Impl::Reserve(&impl_->simt_plane_scratch,
+                      static_cast<size_t>(elements) * sizeof(float));
+        TensorHandle simt_source(histogram->values.data(), {elements},
+                                 ACL_DOUBLE);
+        TensorHandle simt_target(impl_->simt_plane_scratch.data(), {elements},
+                                 ACL_FLOAT);
+        impl_->LaunchAsync(
+            [&](uint64_t* workspace_size, aclOpExecutor** executor) {
+              return aclnnCastGetWorkspaceSize(simt_source.get(), ACL_FLOAT,
+                                               simt_target.get(), workspace_size,
+                                               executor);
+            },
+            aclnnCast);
         const float* simt_gradients =
-            static_cast<const float*>(histogram->simt_planes.data());
+            static_cast<const float*>(impl_->simt_plane_scratch.data());
         const float* simt_hessians = simt_gradients + plane;
 
         // Task construction mirrors CUDA `InitCUDAFeatureMetaInfo`:
