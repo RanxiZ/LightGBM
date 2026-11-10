@@ -1,3 +1,6 @@
+#include <chrono>
+#include <map>
+#include <cstdio>
 /* Copyright (c) 2026. Licensed under the MIT License. */
 #include "npu_runtime.h"
 #include "npu_fused_split.h"
@@ -40,6 +43,8 @@
 #include <aclnnop/aclnn_square.h>
 #include <aclnnop/aclnn_sub.h>
 
+#include <fstream>
+#include <iomanip>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -50,6 +55,19 @@
 #include <numeric>
 
 namespace LightGBM {
+namespace {
+struct PerfPhases {
+ std::map<std::string,std::pair<double,uint64_t>> values;
+ ~PerfPhases(){for(const auto& p:values)fprintf(stderr,"NPU_PHASE %s %.9f %llu\n",p.first.c_str(),p.second.first,(unsigned long long)p.second.second);}
+};
+PerfPhases& PhaseData(){static PerfPhases x;return x;}
+struct PhaseScope {
+ const char* name;bool enabled;std::chrono::steady_clock::time_point start;
+ explicit PhaseScope(const char* n):name(n),enabled(std::getenv("LGBM_NPU_PHASE_TIMING")!=nullptr){if(enabled)start=std::chrono::steady_clock::now();}
+ ~PhaseScope(){if(enabled){auto& x=PhaseData().values[name];x.first+=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();++x.second;}}
+};
+}
+
 
 namespace {
 
@@ -67,7 +85,7 @@ namespace {
 // Scheduling policy of the AI Core SIMT fused histogram kernel, mirrored from
 // npu_fused_histogram_simt_v2.asc. Grid = (partitions, row_chunks); each block
 // owns kFeaturesPerBlock used features and a window of rows.
-constexpr int kSimtFeaturesPerBlock = 4;
+constexpr int kSimtFeaturesPerBlock = 8;
 constexpr int kSimtMaxGrid = 65535;
 constexpr int64_t kSimtRowsPerChunk = 8192;  // bounds the per-block flush cost
 // Mirrors the v2 runtime's kTargetBlocks. The kernel is latency bound on the
@@ -317,6 +335,7 @@ struct NPURuntime::DevicePartition {
 };
 
 struct NPURuntime::Impl {
+  DeviceBuffer refine_features, refine_params, refine_winner, refine_flags;
   int device = 0;
   aclrtContext context = nullptr;
   aclrtStream stream = nullptr;
@@ -324,6 +343,23 @@ struct NPURuntime::Impl {
   int64_t histogram_rows = 0;
   int histogram_stride = 0;
   std::vector<int> histogram_offsets, histogram_bin_counts, histogram_most_frequent;
+  DeviceBuffer partition_scratch_gathered;
+  DeviceBuffer partition_scratch_base;
+  DeviceBuffer partition_scratch_omitted;
+  DeviceBuffer partition_scratch_left;
+  DeviceBuffer partition_scratch_missing_bits;
+  DeviceBuffer partition_scratch_adjusted;
+  DeviceBuffer partition_scratch_not_missing;
+  DeviceBuffer partition_scratch_bits;
+  DeviceBuffer partition_scratch_prefix;
+  DeviceBuffer partition_scratch_left_position;
+  DeviceBuffer partition_scratch_right_position;
+  DeviceBuffer partition_scratch_shifted;
+  DeviceBuffer partition_scratch_destination;
+  DeviceBuffer fix_batch_params, sub_batch_params;
+  DeviceBuffer score_batch_leaves, score_batch_params;
+  DeviceBuffer leaf_argmax_input;
+  DeviceBuffer leaf_argmax_output;
   std::vector<DeviceBuffer> histogram_tiles;
   DeviceBuffer histogram_tile_pointers;
   DeviceBuffer histogram_gradients, histogram_hessians;
@@ -662,6 +698,7 @@ void NPURuntime::SetHistogramBins(const std::vector<std::vector<uint32_t>>& bins
 
 void NPURuntime::SetHistogramGradients(const float* gradients, const float* hessians,
                                        int64_t num_data, bool constant_hessian) {
+  PhaseScope phase_scope("SetHistogramGradients");
   CHECK_EQ(num_data, impl_->histogram_rows);
   ACL_CHECK(aclrtSetCurrentContext(impl_->context));
   const size_t bytes = static_cast<size_t>(num_data) * sizeof(float);
@@ -710,6 +747,7 @@ NPURuntime::HistogramHandle NPURuntime::BuildHistogram(
 
 NPURuntime::HistogramHandle NPURuntime::BuildHistogramFromDeviceRows(
     const int32_t* device_row_indices, int64_t count, const std::vector<int8_t>& used) {
+  PhaseScope phase_scope("BuildHistogramFromDeviceRows");
   CHECK_EQ(used.size(), impl_->histogram_bin_counts.size());
   CHECK_GE(count, 0);
   CHECK_LE(count, impl_->histogram_rows);
@@ -739,7 +777,12 @@ NPURuntime::HistogramHandle NPURuntime::BuildHistogramFromDeviceRows(
     CHECK(impl_->histogram_pairs.data() != nullptr);
     impl_->EnsureSimtMetadata(used);
     if (impl_->simt_num_used == 0) return result;
-    const int row_chunks = PlanRowChunks(count, impl_->simt_partitions);
+    const bool fp32_blocks=!double_precision_ &&
+      std::getenv("LGBM_NPU_DISABLE_SIMT_SPLIT")==nullptr;
+    const int row_chunks = fp32_blocks ? 160 : PlanRowChunks(count, impl_->simt_partitions);
+    int row_group=16;
+    if(const char* v=std::getenv("LGBM_NPU_FP32_ROW_GROUP"))row_group=std::atoi(v);
+    CHECK_GT(row_group,0);
     // shift_gap sets the coarse grid so that count * 2^shift_gap stays inside
     // the 61-bit signed window (see simt_fixed_point.h).
     const int32_t shift_gap = 61 - lgbm_simt::CeilLog2Count(count);
@@ -758,7 +801,7 @@ NPURuntime::HistogramHandle NPURuntime::BuildHistogramFromDeviceRows(
         static_cast<double*>(result->values.data()), result->features,
         impl_->simt_num_used, count, impl_->histogram_stride,
         impl_->simt_partitions, row_chunks, impl_->simt_kernel_stride,
-        shift_gap, 1);
+        shift_gap, fp32_blocks ? 100+row_group : 1);
     ACL_CHECK(aclrtSynchronizeStream(impl_->stream));
     return result;
   }
@@ -1708,6 +1751,7 @@ NPURuntime::PartitionHandle NPURuntime::UploadPartitionRows(const int32_t* rows,
 NPURuntime::PartitionHandle NPURuntime::SplitDeviceRows(
     const int32_t* device_rows, int64_t count, int feature, uint32_t threshold,
     uint32_t default_bin, int missing_type, bool default_left) {
+  PhaseScope phase_scope("SplitDeviceRows");
   CHECK_GE(feature, 0);
   CHECK_LT(feature, static_cast<int>(impl_->histogram_bin_counts.size()));
   CHECK_GE(count, 0);
@@ -1740,13 +1784,19 @@ NPURuntime::PartitionHandle NPURuntime::SplitDeviceRows(
   const int32_t* column = tile + static_cast<int64_t>(local_feature) * impl_->histogram_rows;
   TensorHandle t_column(const_cast<int32_t*>(column), {impl_->histogram_rows}, ACL_INT32);
   TensorHandle t_rows(const_cast<int32_t*>(device_rows), {count}, ACL_INT32);
-  DeviceBuffer gathered(static_cast<size_t>(count) * sizeof(int32_t));
+  Impl::Reserve(&impl_->partition_scratch_gathered,static_cast<size_t>(count)*sizeof(int32_t));
+  auto& gathered=impl_->partition_scratch_gathered;
   TensorHandle t_gathered(gathered.data(), {count}, ACL_INT32);
   impl_->Launch([&](uint64_t* s, aclOpExecutor** e) {
     return aclnnIndexSelectGetWorkspaceSize(t_column.get(), 0, t_rows.get(), t_gathered.get(), s, e);
   }, aclnnIndexSelect);
 
-  DeviceBuffer base(count), omitted(count), left(count);
+  Impl::Reserve(&impl_->partition_scratch_base,count);
+  auto& base=impl_->partition_scratch_base;
+  Impl::Reserve(&impl_->partition_scratch_omitted,count);
+  auto& omitted=impl_->partition_scratch_omitted;
+  Impl::Reserve(&impl_->partition_scratch_left,count);
+  auto& left=impl_->partition_scratch_left;
   TensorHandle t_base(base.data(), {count}, ACL_BOOL);
   TensorHandle t_omitted(omitted.data(), {count}, ACL_BOOL);
   TensorHandle t_left(left.data(), {count}, ACL_BOOL);
@@ -1768,7 +1818,10 @@ NPURuntime::PartitionHandle NPURuntime::SplitDeviceRows(
   }
   // Override missing-value direction, independently of threshold ordering.
   if (missing_type != 0) {
-    DeviceBuffer missing_bits(count), adjusted(count);
+    Impl::Reserve(&impl_->partition_scratch_missing_bits,count);
+  auto& missing_bits=impl_->partition_scratch_missing_bits;
+    Impl::Reserve(&impl_->partition_scratch_adjusted,count);
+  auto& adjusted=impl_->partition_scratch_adjusted;
     TensorHandle t_missing(missing_bits.data(), {count}, ACL_BOOL);
     TensorHandle t_adjusted(adjusted.data(), {count}, ACL_BOOL);
     impl_->Launch([&](uint64_t* s, aclOpExecutor** e) {
@@ -1779,7 +1832,8 @@ NPURuntime::PartitionHandle NPURuntime::SplitDeviceRows(
         return aclnnLogicalOrGetWorkspaceSize(t_left.get(), t_missing.get(), t_adjusted.get(), s, e);
       }, aclnnLogicalOr);
     } else {
-      DeviceBuffer not_missing(count);
+      Impl::Reserve(&impl_->partition_scratch_not_missing,count);
+  auto& not_missing=impl_->partition_scratch_not_missing;
       TensorHandle t_not_missing(not_missing.data(), {count}, ACL_BOOL);
       impl_->Launch([&](uint64_t* s, aclOpExecutor** e) {
         return aclnnLogicalNotGetWorkspaceSize(t_missing.get(), t_not_missing.get(), s, e);
@@ -1792,7 +1846,18 @@ NPURuntime::PartitionHandle NPURuntime::SplitDeviceRows(
   }
 
   const size_t bytes = static_cast<size_t>(count) * sizeof(int32_t);
-  DeviceBuffer bits(bytes), prefix(bytes), left_position(bytes), right_position(bytes), shifted(bytes), destination(bytes);
+  Impl::Reserve(&impl_->partition_scratch_bits,bytes);
+  auto& bits=impl_->partition_scratch_bits;
+  Impl::Reserve(&impl_->partition_scratch_prefix,bytes);
+  auto& prefix=impl_->partition_scratch_prefix;
+  Impl::Reserve(&impl_->partition_scratch_left_position,bytes);
+  auto& left_position=impl_->partition_scratch_left_position;
+  Impl::Reserve(&impl_->partition_scratch_right_position,bytes);
+  auto& right_position=impl_->partition_scratch_right_position;
+  Impl::Reserve(&impl_->partition_scratch_shifted,bytes);
+  auto& shifted=impl_->partition_scratch_shifted;
+  Impl::Reserve(&impl_->partition_scratch_destination,bytes);
+  auto& destination=impl_->partition_scratch_destination;
   TensorHandle t_bits(bits.data(), {count}, ACL_INT32);
   TensorHandle t_prefix(prefix.data(), {count}, ACL_INT32);
   TensorHandle t_left_position(left_position.data(), {count}, ACL_INT32);
@@ -2021,21 +2086,23 @@ void NPURuntime::AddPredictionToScore(const std::vector<ScoreLeaf>& leaves,
     }
   }
   DeviceBuffer& device_scores = score_it->second.device;
-  TensorHandle t_scores(device_scores.data(), {num_data}, ACL_DOUBLE);
-  for (const auto& leaf : leaves) {
-    CHECK(leaf.partition != nullptr);
-    const int64_t count = leaf.left ? leaf.partition->left_count
-                                    : leaf.partition->count - leaf.partition->left_count;
-    CHECK_GE(count, 0);
-    CHECK_LE(count, num_data);
-    if (count == 0) continue;
-    TensorHandle t_rows(const_cast<int32_t*>(PartitionRowsDevice(leaf.partition, leaf.left)),
-                         {count}, ACL_INT32);
-    ScalarHandle value(leaf.output, ACL_DOUBLE);
-    impl_->Launch([&](uint64_t* s, aclOpExecutor** e) {
-      return aclnnInplaceScatterValueGetWorkspaceSize(t_scores.get(), 0, t_rows.get(),
-                                                       value.get(), 1, s, e);
-    }, aclnnInplaceScatterValue);
+  std::vector<LGBMNPUScoreLeaf> batch;
+  for(const auto& leaf:leaves) {
+    CHECK(leaf.partition!=nullptr);
+    const int64_t count=leaf.left?leaf.partition->left_count:leaf.partition->count-leaf.partition->left_count;
+    CHECK_GE(count,0);CHECK_LE(count,num_data);
+    if(count>0)batch.push_back({PartitionRowsDevice(leaf.partition,leaf.left),count,leaf.output});
+  }
+  if(!batch.empty()) {
+    Impl::Reserve(&impl_->score_batch_leaves,batch.size()*sizeof(LGBMNPUScoreLeaf));
+    Impl::Reserve(&impl_->score_batch_params,sizeof(LGBMNPUScoreBatch));
+    impl_->UploadInto(impl_->score_batch_leaves,batch.data(),batch.size()*sizeof(LGBMNPUScoreLeaf));
+    LGBMNPUScoreBatch params={static_cast<int64_t>(batch.size())};
+    impl_->UploadInto(impl_->score_batch_params,&params,sizeof(params));
+    LGBMNPUScoreBatchKernel(1,nullptr,impl_->stream,static_cast<double*>(device_scores.data()),
+      static_cast<const LGBMNPUScoreLeaf*>(impl_->score_batch_leaves.data()),
+      static_cast<const LGBMNPUScoreBatch*>(impl_->score_batch_params.data()));
+    ACL_CHECK(aclrtSynchronizeStream(impl_->stream));
   }
   impl_->Download(scores, device_scores, static_cast<size_t>(num_data) * sizeof(double));
   score_it->second.host_shadow.assign(scores, scores + num_data);
@@ -2077,9 +2144,12 @@ NPURuntime::HistogramResult NPURuntime::BatchedHistogram(
 
 void NPURuntime::FixHistogram(const HistogramHandle& histogram,
                               double sum_gradient, double sum_hessian) {
+  PhaseScope phase_scope("FixHistogram");
   CHECK(histogram != nullptr);
   CHECK(!histogram->fixed);
   ACL_CHECK(aclrtSetCurrentContext(impl_->context));
+  // Previous queued fix may still read persistent metadata before this call overwrites it.
+  ACL_CHECK(aclrtSynchronizeStream(impl_->stream));
   const int64_t plane = static_cast<int64_t>(histogram->features) * histogram->stride;
   const int64_t elements = 2 * plane;
   std::vector<int64_t> last_indices, destinations;
@@ -2111,6 +2181,16 @@ void NPURuntime::FixHistogram(const HistogramHandle& histogram,
     impl_->UploadInto(impl_->fix_last_indices, last_indices.data(), index_bytes);
     impl_->UploadInto(impl_->fix_destinations, destinations.data(), index_bytes);
     impl_->UploadInto(impl_->fix_parents, totals.data(), fix_bytes);
+    if(std::getenv("LGBM_NPU_DISABLE_BATCH_FIX")==nullptr) {
+      const int64_t params[2]={fixes,histogram->stride};
+      Impl::Reserve(&impl_->fix_batch_params,sizeof(params));
+      impl_->UploadInto(impl_->fix_batch_params,params,sizeof(params));
+      LGBMNPUFixBatchKernel(1,nullptr,impl_->stream,static_cast<double*>(histogram->values.data()),
+        static_cast<const int64_t*>(impl_->fix_last_indices.data()),
+        static_cast<const int64_t*>(impl_->fix_destinations.data()),
+        static_cast<const double*>(impl_->fix_parents.data()),
+        static_cast<const int64_t*>(impl_->fix_batch_params.data()));
+    } else {
     TensorHandle input(histogram->values.data(), {2 * histogram->features, histogram->stride}, ACL_DOUBLE);
     TensorHandle output(impl_->fix_prefix.data(), {2 * histogram->features, histogram->stride}, ACL_DOUBLE);
     impl_->LaunchAsync([&](uint64_t* s, aclOpExecutor** e) {
@@ -2146,12 +2226,14 @@ void NPURuntime::FixHistogram(const HistogramHandle& histogram,
                               static_cast<double*>(impl_->fix_residuals.data()) + i, sizeof(double), ACL_MEMCPY_DEVICE_TO_DEVICE));
       }
     }
+    }
   }
   histogram->fixed = true;
 }
 
 void NPURuntime::SubtractHistogram(const HistogramHandle& parent,
                                    const HistogramHandle& smaller) {
+  PhaseScope phase_scope("SubtractHistogram");
   CHECK(parent != nullptr && smaller != nullptr);
   CHECK(parent->fixed && smaller->fixed);
   CHECK(parent != smaller);
@@ -2166,6 +2248,13 @@ void NPURuntime::SubtractHistogram(const HistogramHandle& parent,
   // allocating and freeing one per leaf. The subtraction itself is enqueued
   // without a host round trip.
   DeviceBuffer previous = std::move(parent->values);
+  if(std::getenv("LGBM_NPU_DISABLE_BATCH_SUB")==nullptr) {
+    Impl::Reserve(&impl_->sub_batch_params,sizeof(elements));
+    impl_->UploadInto(impl_->sub_batch_params,&elements,sizeof(elements));
+    LGBMNPUSubBatchKernel(1,nullptr,impl_->stream,
+      static_cast<const double*>(previous.data()),static_cast<const double*>(smaller->values.data()),
+      static_cast<double*>(impl_->subtract_buffer.data()),static_cast<const int64_t*>(impl_->sub_batch_params.data()));
+  } else {
   TensorHandle a(previous.data(), {elements}, ACL_DOUBLE);
   TensorHandle b(smaller->values.data(), {elements}, ACL_DOUBLE);
   TensorHandle out(impl_->subtract_buffer.data(), {elements}, ACL_DOUBLE);
@@ -2173,6 +2262,8 @@ void NPURuntime::SubtractHistogram(const HistogramHandle& parent,
   impl_->LaunchAsync([&](uint64_t* s, aclOpExecutor** e) {
     return aclnnSubGetWorkspaceSize(a.get(), b.get(), one.get(), out.get(), s, e);
   }, aclnnSub);
+
+  }
   parent->values = std::move(impl_->subtract_buffer);
   impl_->subtract_buffer = std::move(previous);
   parent->used = smaller->used;
@@ -2425,8 +2516,12 @@ int64_t NPURuntime::ArgMax(const std::vector<double>& input) {
   ACL_CHECK(aclrtSetCurrentContext(impl_->context));
 
   const int64_t count = static_cast<int64_t>(input.size());
-  DeviceBuffer d_in = impl_->Upload(input.data(), input.size() * sizeof(double));
-  DeviceBuffer d_out = impl_->Zeros(sizeof(int64_t));
+  Impl::Reserve(&impl_->leaf_argmax_input,input.size()*sizeof(double));
+  impl_->UploadInto(impl_->leaf_argmax_input,input.data(),input.size()*sizeof(double));
+  auto& d_in=impl_->leaf_argmax_input;
+  Impl::Reserve(&impl_->leaf_argmax_output,sizeof(int64_t));
+  auto& d_out=impl_->leaf_argmax_output;
+  const int64_t zero=0;impl_->UploadInto(d_out,&zero,sizeof(zero));
 
   const std::vector<int64_t> shape = {count};
   const std::vector<int64_t> scalar_shape = {1};
@@ -2496,6 +2591,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
     int min_data_in_leaf, double min_sum_hessian_in_leaf,
     double min_gain_to_split, const HistogramHandle& histogram,
     double max_delta_step, double path_smooth, double parent_output) {
+  PhaseScope phase_scope("FindBestSplit");
   ++split_calls_;
   SplitResult result;
   result.splittable.resize(features.size(), 0);
@@ -2554,6 +2650,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
       metadata.feature = f.feature;
       metadata.input_index = static_cast<int32_t>(fi);
       metadata.histogram_index = f.histogram_index;
+      metadata.cuda_task_index = f.cuda_task_index;
       metadata.num_bin = f.num_bin;
       metadata.offset = f.offset;
       metadata.default_bin = f.default_bin;
@@ -2615,7 +2712,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
     if (!impl_->simt_split_failed && max_delta_step <= 0.0 &&
         simt_penalty_supported && !simt_random_gate_diverges &&
         !(simt_randomized && simt_exhaustive) &&
-        std::getenv("LGBM_NPU_DISABLE_SIMT_SPLIT") == nullptr) {
+        !double_precision_ && std::getenv("LGBM_NPU_DISABLE_SIMT_SPLIT") == nullptr) {
       if (impl_->simt_split == nullptr) {
         std::unique_ptr<lgbm_npu_simt::SimtSplitOperator> candidate_operator(
             new lgbm_npu_simt::SimtSplitOperator());
@@ -2669,6 +2766,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
               metadata.num_bin > 2 && metadata.missing_type != 0;
           lgbm_npu_simt::SimtSplitTask task = {};
           task.inner_feature_index = metadata.feature;
+          task.reserved = static_cast<uint32_t>(metadata.cuda_task_index);
           task.input_index = metadata.input_index;
           task.hist_offset = static_cast<int64_t>(metadata.histogram_index) *
                              static_cast<int64_t>(histogram->stride);
@@ -2686,6 +2784,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
             task.assume_out_default_left = 0;
             simt_tasks.push_back(task);
             task.reverse = 1;
+            task.reserved = static_cast<uint32_t>(metadata.cuda_task_index + 1);
             task.assume_out_default_left = 1;
             simt_tasks.push_back(task);
           } else {
@@ -2760,23 +2859,20 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
             // The device merge already applies "first maximum gain in task
             // order", but it cannot see `enabled`; redo the merge on the host
             // when the device winner belongs to a disabled feature.
+
+            auto cuda_rank = [](uint32_t i) {
+              uint32_t l=i%32,w=(i%1024)/32,rl=0,rw=0;
+              for(int j=0;j<5;++j){rl=(rl<<1)|(l&1);l>>=1;rw=(rw<<1)|(w&1);w>>=1;}
+              return (i/1024)*1024+rw*32+rl;
+            };
             int32_t best_task = -1;
-            if (simt_winner.is_valid != 0 &&
-                features[static_cast<size_t>(simt_winner.input_index)].enabled) {
-              best_task = static_cast<int32_t>(simt_winner.task_index);
-            } else {
-              for (size_t task_index = 0; task_index < simt_candidates.size();
-                   ++task_index) {
-                const auto& candidate = simt_candidates[task_index];
-                if (candidate.is_valid == 0) continue;
-                if (!features[static_cast<size_t>(candidate.input_index)].enabled) {
-                  continue;
-                }
-                if (best_task < 0 ||
-                    candidate.gain > simt_candidates[best_task].gain) {
-                  best_task = static_cast<int32_t>(task_index);
-                }
-              }
+            for(size_t j=0;j<simt_candidates.size();++j) {
+              const auto& c=simt_candidates[j];
+              if(!c.is_valid || !features[c.input_index].enabled)continue;
+              if(best_task<0 || c.gain>simt_candidates[best_task].gain ||
+                (c.gain==simt_candidates[best_task].gain &&
+                 cuda_rank(simt_tasks[j].reserved)<cuda_rank(simt_tasks[best_task].reserved)))
+                best_task=static_cast<int32_t>(j);
             }
             ++argmax_calls_;
             if (best_task >= 0) {
@@ -2801,6 +2897,87 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
                   static_cast<double>(winner.right_sum_hessians);
               result.left_count = winner.left_count;
               result.right_count = winner.right_count;
+              // SIMT owns feature, threshold and direction selection.
+              // Re-evaluate only that selected split on resident FP64 bins.
+              LGBMNPUFusedSplitFeature rf = {};
+              bool refinement_metadata_found=false;
+              for(const auto& f:packed) {
+                if(f.input_index==winner.input_index) {
+                  rf=f;refinement_metadata_found=true;break;
+                }
+              }
+              CHECK(refinement_metadata_found);
+              rf.input_index=0;rf.enabled=1;rf.randomized=1;
+              rf.random_threshold=static_cast<int32_t>(winner.threshold);
+              rf.refine_direction=0;
+              std::vector<LGBMNPUFusedSplitFeature> refine_features;
+              for(size_t j=0;j<simt_candidates.size();++j) {
+                const auto& candidate=simt_candidates[j];
+                if(!candidate.is_valid || candidate.gain!=winner.gain ||
+                   !features[candidate.input_index].enabled)continue;
+                bool duplicate=false;
+                for(const auto& q:refine_features)
+                  if(q.feature==static_cast<int32_t>(candidate.inner_feature_index) &&
+                     q.random_threshold==static_cast<int32_t>(candidate.threshold))duplicate=true;
+                if(duplicate)continue;
+                for(const auto& q:packed)if(q.input_index==candidate.input_index) {
+                  auto selected=q;selected.input_index=static_cast<int32_t>(refine_features.size());
+                  selected.enabled=1;selected.randomized=1;
+                  selected.random_threshold=static_cast<int32_t>(candidate.threshold);
+                  selected.refine_direction=0;refine_features.push_back(selected);break;
+                }
+              }
+              CHECK(!refine_features.empty());
+
+    LGBMNPUFusedSplitParameters rp = {};
+    rp.histogram_plane = static_cast<int64_t>(histogram->features) * histogram->stride;
+    rp.histogram_stride = histogram->stride;
+    rp.num_features = static_cast<int32_t>(refine_features.size());
+    rp.num_data = num_data;
+    rp.min_data_in_leaf = min_data_in_leaf;
+    rp.sum_gradient = sum_gradient;
+    rp.sum_hessian = sum_hessian;
+    rp.lambda_l1 = lambda_l1;
+    rp.lambda_l2 = lambda_l2;
+    rp.min_sum_hessian_in_leaf = min_sum_hessian_in_leaf;
+    rp.min_gain_to_split = min_gain_to_split;
+    rp.max_delta_step = max_delta_step;
+    rp.path_smooth = path_smooth;
+    rp.parent_output = parent_output;
+
+
+              Impl::Reserve(&impl_->refine_features,refine_features.size()*sizeof(rf));
+              Impl::Reserve(&impl_->refine_params,sizeof(rp));
+              Impl::Reserve(&impl_->refine_winner,sizeof(LGBMNPUFusedSplitWinner));
+              Impl::Reserve(&impl_->refine_flags,refine_features.size()*sizeof(uint8_t));
+              impl_->UploadInto(impl_->refine_features,refine_features.data(),refine_features.size()*sizeof(rf));
+              impl_->UploadInto(impl_->refine_params,&rp,sizeof(rp));
+              LGBMNPUFusedSplitWinner empty_refined={};
+              impl_->UploadInto(impl_->refine_winner,&empty_refined,sizeof(empty_refined));
+              std::vector<uint8_t> empty_flags(refine_features.size(),0);
+              impl_->UploadInto(impl_->refine_flags,empty_flags.data(),empty_flags.size());
+              auto& rfeatures=impl_->refine_features;auto& rparams=impl_->refine_params;
+              auto& rwinner=impl_->refine_winner;auto& rflags=impl_->refine_flags;
+              LGBMNPUFusedSplitKernel(1,nullptr,impl_->stream,
+                static_cast<const double*>(histogram->values.data()),
+                static_cast<const LGBMNPUFusedSplitFeature*>(rfeatures.data()),
+                static_cast<const LGBMNPUFusedSplitParameters*>(rparams.data()),
+                static_cast<LGBMNPUFusedSplitWinner*>(rwinner.data()),
+                static_cast<uint8_t*>(rflags.data()));
+              ACL_CHECK(aclrtSynchronizeStream(impl_->stream));
+              LGBMNPUFusedSplitWinner refined={};
+              impl_->Download(&refined,rwinner,sizeof(refined));
+              if(refined.completed!=1 || refined.feature<0)
+                Log::Fatal("SIMT tied candidate FP64 refinement failed");
+              result.feature=refined.feature;
+              result.threshold=refined.threshold;
+              result.default_left=refined.default_left!=0;
+              result.gain=refined.gain;
+              result.left_output=refined.left_output;result.right_output=refined.right_output;
+              result.left_gradient=refined.left_gradient;result.right_gradient=refined.right_gradient;
+              result.left_hessian=refined.left_hessian;result.right_hessian=refined.right_hessian;
+              result.left_count=refined.left_count;result.right_count=refined.right_count;
+
             }
             return result;
           }
@@ -2808,6 +2985,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
       }
     }
 
+    if (std::getenv("LGBM_NPU_REQUIRE_SIMT") != nullptr) Log::Fatal("Required default SIMT path was not selected");
     LGBMNPUFusedSplitParameters parameters = {};
     parameters.histogram_plane = static_cast<int64_t>(histogram->features) * histogram->stride;
     parameters.histogram_stride = histogram->stride;

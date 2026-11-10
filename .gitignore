@@ -485,3 +485,12 @@ dmypy.json
 
 # files created by release tasks
 /release-artifacts
+
+# Ascend NPU reproduction outputs
+/build-npu-npa1/
+/npu/_state/
+/npu_*_probe
+/npu_reference_check.json
+
+# Pinned, audited Qlib source snapshot (not data or model artifacts).
+!/npu/qlib_source.tar.gz

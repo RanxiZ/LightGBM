@@ -1,0 +1,385 @@
+{
+  "scope": "Five ordinary installed qrun CLI processes; formal paths; balance version, not strict CUDA matching",
+  "runs": [
+    {
+      "timing": {
+        "run": 1,
+        "command": [
+          "/usr/local/python3.12.13/bin/qrun",
+          "/workspace/qlib/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml",
+          "--experiment_name=lightgbm_balanced_formal_20261110",
+          "--uri_folder=/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_1/mlruns"
+        ],
+        "process_wall_seconds": 70.24776754062623,
+        "library_mapped": "/usr/local/python3.12.13/lib/python3.12/site-packages/lightgbm/lib/lib_lightgbm.so",
+        "library_sha256": "8debae8424e431860be7b0bb11a1444b7fe700e10682aa961972a315317b9bdf",
+        "artifacts": "/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_1/mlruns/375460330785625555/fec7c14ab0024651aef5643ff199606d/artifacts",
+        "evaluated_iterations": 63,
+        "all_record_artifacts_present": true
+      },
+      "best_iteration": 13,
+      "params": {
+        "objective": "mse",
+        "verbosity": -1,
+        "colsample_bytree": 0.8879,
+        "learning_rate": 0.2,
+        "subsample": 0.8789,
+        "lambda_l1": 205.6999,
+        "lambda_l2": 580.9768,
+        "max_depth": -1,
+        "num_leaves": 210,
+        "num_threads": 20,
+        "device": "npu",
+        "gpu_use_dp": false,
+        "verbose": 2,
+        "num_iterations": 1000
+      },
+      "tree_structure_equal": true,
+      "segments": {
+        "valid": {
+          "metrics": {
+            "MSE": 0.9938450119697531,
+            "IC": 0.05970897898893684,
+            "ICIR": 0.4697647994741397,
+            "RankIC": 0.06018959797692261,
+            "RankICIR": 0.45581161596833003
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        },
+        "test": {
+          "metrics": {
+            "MSE": 0.004563345870638471,
+            "IC": 0.043063400500304244,
+            "ICIR": 0.35605515233814733,
+            "RankIC": 0.04533606968427339,
+            "RankICIR": 0.38505165504311134
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        }
+      }
+    },
+    {
+      "timing": {
+        "run": 2,
+        "command": [
+          "/usr/local/python3.12.13/bin/qrun",
+          "/workspace/qlib/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml",
+          "--experiment_name=lightgbm_balanced_formal_20261110",
+          "--uri_folder=/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_2/mlruns"
+        ],
+        "process_wall_seconds": 72.70838210266083,
+        "library_mapped": "/usr/local/python3.12.13/lib/python3.12/site-packages/lightgbm/lib/lib_lightgbm.so",
+        "library_sha256": "8debae8424e431860be7b0bb11a1444b7fe700e10682aa961972a315317b9bdf",
+        "artifacts": "/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_2/mlruns/793394534542312452/403dd47cf3f4424ba55c2fe9f55ead92/artifacts",
+        "evaluated_iterations": 63,
+        "all_record_artifacts_present": true
+      },
+      "best_iteration": 13,
+      "params": {
+        "objective": "mse",
+        "verbosity": -1,
+        "colsample_bytree": 0.8879,
+        "learning_rate": 0.2,
+        "subsample": 0.8789,
+        "lambda_l1": 205.6999,
+        "lambda_l2": 580.9768,
+        "max_depth": -1,
+        "num_leaves": 210,
+        "num_threads": 20,
+        "device": "npu",
+        "gpu_use_dp": false,
+        "verbose": 2,
+        "num_iterations": 1000
+      },
+      "tree_structure_equal": true,
+      "segments": {
+        "valid": {
+          "metrics": {
+            "MSE": 0.9938450119697531,
+            "IC": 0.05970897898893684,
+            "ICIR": 0.4697647994741397,
+            "RankIC": 0.06018959797692261,
+            "RankICIR": 0.45581161596833003
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        },
+        "test": {
+          "metrics": {
+            "MSE": 0.004563345870638471,
+            "IC": 0.043063400500304244,
+            "ICIR": 0.35605515233814733,
+            "RankIC": 0.04533606968427339,
+            "RankICIR": 0.38505165504311134
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        }
+      }
+    },
+    {
+      "timing": {
+        "run": 3,
+        "command": [
+          "/usr/local/python3.12.13/bin/qrun",
+          "/workspace/qlib/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml",
+          "--experiment_name=lightgbm_balanced_formal_20261110",
+          "--uri_folder=/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_3/mlruns"
+        ],
+        "process_wall_seconds": 71.54493609583005,
+        "library_mapped": "/usr/local/python3.12.13/lib/python3.12/site-packages/lightgbm/lib/lib_lightgbm.so",
+        "library_sha256": "8debae8424e431860be7b0bb11a1444b7fe700e10682aa961972a315317b9bdf",
+        "artifacts": "/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_3/mlruns/484763715497446616/2cc7470edc4d4d54965b939535f85121/artifacts",
+        "evaluated_iterations": 63,
+        "all_record_artifacts_present": true
+      },
+      "best_iteration": 13,
+      "params": {
+        "objective": "mse",
+        "verbosity": -1,
+        "colsample_bytree": 0.8879,
+        "learning_rate": 0.2,
+        "subsample": 0.8789,
+        "lambda_l1": 205.6999,
+        "lambda_l2": 580.9768,
+        "max_depth": -1,
+        "num_leaves": 210,
+        "num_threads": 20,
+        "device": "npu",
+        "gpu_use_dp": false,
+        "verbose": 2,
+        "num_iterations": 1000
+      },
+      "tree_structure_equal": true,
+      "segments": {
+        "valid": {
+          "metrics": {
+            "MSE": 0.9938450119697531,
+            "IC": 0.05970897898893684,
+            "ICIR": 0.4697647994741397,
+            "RankIC": 0.06018959797692261,
+            "RankICIR": 0.45581161596833003
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        },
+        "test": {
+          "metrics": {
+            "MSE": 0.004563345870638471,
+            "IC": 0.043063400500304244,
+            "ICIR": 0.35605515233814733,
+            "RankIC": 0.04533606968427339,
+            "RankICIR": 0.38505165504311134
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        }
+      }
+    },
+    {
+      "timing": {
+        "run": 4,
+        "command": [
+          "/usr/local/python3.12.13/bin/qrun",
+          "/workspace/qlib/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml",
+          "--experiment_name=lightgbm_balanced_formal_20261110",
+          "--uri_folder=/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_4/mlruns"
+        ],
+        "process_wall_seconds": 71.97235205490142,
+        "library_mapped": "/usr/local/python3.12.13/lib/python3.12/site-packages/lightgbm/lib/lib_lightgbm.so",
+        "library_sha256": "8debae8424e431860be7b0bb11a1444b7fe700e10682aa961972a315317b9bdf",
+        "artifacts": "/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_4/mlruns/441223732713121816/1c70e21a8fd44229a2c468ade9ea09d8/artifacts",
+        "evaluated_iterations": 63,
+        "all_record_artifacts_present": true
+      },
+      "best_iteration": 13,
+      "params": {
+        "objective": "mse",
+        "verbosity": -1,
+        "colsample_bytree": 0.8879,
+        "learning_rate": 0.2,
+        "subsample": 0.8789,
+        "lambda_l1": 205.6999,
+        "lambda_l2": 580.9768,
+        "max_depth": -1,
+        "num_leaves": 210,
+        "num_threads": 20,
+        "device": "npu",
+        "gpu_use_dp": false,
+        "verbose": 2,
+        "num_iterations": 1000
+      },
+      "tree_structure_equal": true,
+      "segments": {
+        "valid": {
+          "metrics": {
+            "MSE": 0.9938450119697531,
+            "IC": 0.05970897898893684,
+            "ICIR": 0.4697647994741397,
+            "RankIC": 0.06018959797692261,
+            "RankICIR": 0.45581161596833003
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        },
+        "test": {
+          "metrics": {
+            "MSE": 0.004563345870638471,
+            "IC": 0.043063400500304244,
+            "ICIR": 0.35605515233814733,
+            "RankIC": 0.04533606968427339,
+            "RankICIR": 0.38505165504311134
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        }
+      }
+    },
+    {
+      "timing": {
+        "run": 5,
+        "command": [
+          "/usr/local/python3.12.13/bin/qrun",
+          "/workspace/qlib/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml",
+          "--experiment_name=lightgbm_balanced_formal_20261110",
+          "--uri_folder=/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_5/mlruns"
+        ],
+        "process_wall_seconds": 70.28702903632075,
+        "library_mapped": "/usr/local/python3.12.13/lib/python3.12/site-packages/lightgbm/lib/lib_lightgbm.so",
+        "library_sha256": "8debae8424e431860be7b0bb11a1444b7fe700e10682aa961972a315317b9bdf",
+        "artifacts": "/workspace/z30084427/lightgbm_balanced_20261110/formal_runs/run_5/mlruns/799712798593940226/e65f5dab49504df097ecc5f786f0eec8/artifacts",
+        "evaluated_iterations": 63,
+        "all_record_artifacts_present": true
+      },
+      "best_iteration": 13,
+      "params": {
+        "objective": "mse",
+        "verbosity": -1,
+        "colsample_bytree": 0.8879,
+        "learning_rate": 0.2,
+        "subsample": 0.8789,
+        "lambda_l1": 205.6999,
+        "lambda_l2": 580.9768,
+        "max_depth": -1,
+        "num_leaves": 210,
+        "num_threads": 20,
+        "device": "npu",
+        "gpu_use_dp": false,
+        "verbose": 2,
+        "num_iterations": 1000
+      },
+      "tree_structure_equal": true,
+      "segments": {
+        "valid": {
+          "metrics": {
+            "MSE": 0.9938450119697531,
+            "IC": 0.05970897898893684,
+            "ICIR": 0.4697647994741397,
+            "RankIC": 0.06018959797692261,
+            "RankICIR": 0.45581161596833003
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        },
+        "test": {
+          "metrics": {
+            "MSE": 0.004563345870638471,
+            "IC": 0.043063400500304244,
+            "ICIR": 0.35605515233814733,
+            "RankIC": 0.04533606968427339,
+            "RankICIR": 0.38505165504311134
+          },
+          "metric_delta_vs_isolated": {
+            "MSE": 0.0,
+            "IC": 0.0,
+            "ICIR": 0.0,
+            "RankIC": 0.0,
+            "RankICIR": 0.0
+          },
+          "max_prediction_diff_vs_stable": 0.0,
+          "bit_differences_vs_stable": 0
+        }
+      }
+    }
+  ],
+  "timing": {
+    "seconds": [
+      70.24776754062623,
+      72.70838210266083,
+      71.54493609583005,
+      71.97235205490142,
+      70.28702903632075
+    ],
+    "median": 71.54493609583005,
+    "min": 70.24776754062623,
+    "max": 72.70838210266083
+  },
+  "median_ratio_vs_isolated": 0.986869732931818,
+  "formal_balance_verification_pass": true,
+  "strict_cuda_aggregate_match": false
+}

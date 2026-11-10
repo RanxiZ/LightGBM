@@ -8,6 +8,17 @@
 Light Gradient Boosting Machine
 ===============================
 
+## Ascend NPU reproduction: lightgbm_npu_npa1
+
+This branch includes the validated Ascend NPU backend and a one-time Qlib setup workflow.
+See [the NPU setup and reproduction guide](npu/README.zh-CN.md). After setup:
+
+```bash
+cd /workspace/qlib/examples
+qrun benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml
+```
+
+
 [![C++ GitHub Actions Build Status](https://github.com/lightgbm-org/LightGBM/actions/workflows/cpp.yml/badge.svg?branch=main)](https://github.com/lightgbm-org/LightGBM/actions/workflows/cpp.yml)
 [![Python-package GitHub Actions Build Status](https://github.com/lightgbm-org/LightGBM/actions/workflows/python_package.yml/badge.svg?branch=main)](https://github.com/lightgbm-org/LightGBM/actions/workflows/python_package.yml)
 [![R-package GitHub Actions Build Status](https://github.com/lightgbm-org/LightGBM/actions/workflows/r_package.yml/badge.svg?branch=main)](https://github.com/lightgbm-org/LightGBM/actions/workflows/r_package.yml)

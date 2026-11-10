@@ -1,0 +1,65 @@
+{
+  "all_exact_equal_to_isolated": true,
+  "runs": [
+    {
+      "run": 1,
+      "all_portfolio_objects_exact_equal": true,
+      "artifacts": [
+        "indicator_analysis_1day.pkl",
+        "indicators_normal_1day.pkl",
+        "indicators_normal_1day_obj.pkl",
+        "port_analysis_1day.pkl",
+        "positions_normal_1day.pkl",
+        "report_normal_1day.pkl"
+      ]
+    },
+    {
+      "run": 2,
+      "all_portfolio_objects_exact_equal": true,
+      "artifacts": [
+        "indicator_analysis_1day.pkl",
+        "indicators_normal_1day.pkl",
+        "indicators_normal_1day_obj.pkl",
+        "port_analysis_1day.pkl",
+        "positions_normal_1day.pkl",
+        "report_normal_1day.pkl"
+      ]
+    },
+    {
+      "run": 3,
+      "all_portfolio_objects_exact_equal": true,
+      "artifacts": [
+        "indicator_analysis_1day.pkl",
+        "indicators_normal_1day.pkl",
+        "indicators_normal_1day_obj.pkl",
+        "port_analysis_1day.pkl",
+        "positions_normal_1day.pkl",
+        "report_normal_1day.pkl"
+      ]
+    },
+    {
+      "run": 4,
+      "all_portfolio_objects_exact_equal": true,
+      "artifacts": [
+        "indicator_analysis_1day.pkl",
+        "indicators_normal_1day.pkl",
+        "indicators_normal_1day_obj.pkl",
+        "port_analysis_1day.pkl",
+        "positions_normal_1day.pkl",
+        "report_normal_1day.pkl"
+      ]
+    },
+    {
+      "run": 5,
+      "all_portfolio_objects_exact_equal": true,
+      "artifacts": [
+        "indicator_analysis_1day.pkl",
+        "indicators_normal_1day.pkl",
+        "indicators_normal_1day_obj.pkl",
+        "port_analysis_1day.pkl",
+        "positions_normal_1day.pkl",
+        "report_normal_1day.pkl"
+      ]
+    }
+  ]
+}

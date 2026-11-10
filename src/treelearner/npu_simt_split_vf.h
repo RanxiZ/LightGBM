@@ -42,6 +42,12 @@
 namespace lgbm_npu_simt {
 
 constexpr int32_t kWarpSize = 32;
+__SIMT_DEVICE_FUNCTIONS_DECL__ inline uint32_t CudaTieRank(uint32_t i) {
+ uint32_t lane=i%32,warp=(i%1024)/32,rl=0,rw=0;
+ for(int j=0;j<5;++j){rl=(rl<<1)|(lane&1);lane>>=1;rw=(rw<<1)|(warp&1);warp>>=1;}
+ return (i/1024)*1024+rw*32+rl;
+}
+
 
 // ---------------------------------------------------------------------------
 // Leaf gain formulas (cuda_leaf_splits.hpp:66-160), FP32.
@@ -152,7 +158,7 @@ __SIMT_DEVICE_FUNCTIONS_DECL__ inline void WarpArgMaxGain(int32_t& found, float&
         asc_shfl_xor(pos, static_cast<int32_t>(offset), kWarpSize);
     const bool take = (other_found != 0) &&
                       ((found == 0) || (other_gain > gain) ||
-                       (other_gain == gain && other_pos < pos));
+                       (other_gain == gain && CudaTieRank(other_pos) < CudaTieRank(pos)));
     if (take) {
       found = other_found;
       gain = other_gain;
@@ -508,7 +514,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) void ScanTaskVF(
 
       const bool better = (lane_found != 0) &&
                           ((best_found == 0) || (lane_gain > best_gain) ||
-                           (lane_gain == best_gain && lane_pos < best_pos));
+                           (lane_gain == best_gain && CudaTieRank(lane_pos) < CudaTieRank(best_pos)));
       if (better) {
         best_found = 1;
         best_gain = lane_gain;

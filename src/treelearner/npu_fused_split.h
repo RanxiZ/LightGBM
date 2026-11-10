@@ -15,8 +15,10 @@ struct LGBMNPUFusedSplitFeature {
   int32_t default_bin;
   int32_t missing_type;
   int32_t enabled;
+  int32_t cuda_task_index;
   int32_t randomized;
   int32_t random_threshold;
+  int32_t refine_direction;  // 0 unrestricted, 1 forward, 2 reverse
   double penalty;
 };
 
@@ -55,6 +57,8 @@ struct LGBMNPUFusedSplitWinner {
   double right_hessian;
 };
 
+struct LGBMNPUScoreLeaf { const int32_t* rows; int64_t count; double output; };
+struct LGBMNPUScoreBatch { int64_t leaves; };
 // All pointers except stream address device memory. Features are stable-sorted
 // by original feature index; flags are returned in input_index order. The
 // caller synchronizes the stream before downloading winner and flags.
@@ -67,7 +71,11 @@ extern "C" void LGBMNPUFusedSplitKernel(
     const LGBMNPUFusedSplitParameters* parameters,
     LGBMNPUFusedSplitWinner* winner, uint8_t* splittable);
 
-static_assert(sizeof(LGBMNPUFusedSplitFeature) == 48, "fused split feature ABI");
+extern "C" void LGBMNPUScoreBatchKernel(uint32_t block_dim, void* launch_config, void* stream,
+ double* scores,const LGBMNPUScoreLeaf* leaves,const LGBMNPUScoreBatch* params);
+extern "C" void LGBMNPUFixBatchKernel(uint32_t,void*,void*,double*,const int64_t*,const int64_t*,const double*,const int64_t*);
+extern "C" void LGBMNPUSubBatchKernel(uint32_t,void*,void*,const double*,const double*,double*,const int64_t*);
+static_assert(sizeof(LGBMNPUFusedSplitFeature) == 56, "fused split feature ABI");
 static_assert(sizeof(LGBMNPUFusedSplitParameters) == 96, "fused split parameter ABI");
 static_assert(sizeof(LGBMNPUFusedSplitWinner) == 80, "fused split winner ABI");
 

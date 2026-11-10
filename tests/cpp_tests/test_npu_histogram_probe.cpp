@@ -1337,8 +1337,65 @@ void RunQuantizedHistogramProbe() {
 
 }  // namespace
 
+void RunStableFP32HistogramProbe() {
+  LightGBM::NPURuntime runtime(0);
+  runtime.SetDoublePrecision(false);
+  constexpr int features=9;
+  for(int max_bins:{17,45,100,255}) for(int rows:{257,8193,65537,491884}) {
+    if(rows==491884 && max_bins!=255)continue;
+    std::vector<std::vector<uint32_t>> bins(features,std::vector<uint32_t>(rows));
+    std::vector<int> offsets(features),sizes(features);
+    std::vector<int8_t> used(features,1);used[3]=0;
+    std::vector<float> g(rows),h(rows);
+    for(int f=0;f<features;++f) {
+      offsets[f]=f%2;sizes[f]=max_bins-f%3;
+      for(int r=0;r<rows;++r)bins[f][r]=(r*17+f*31+(r>>3))%sizes[f];
+    }
+    for(int r=0;r<rows;++r) {
+      g[r]=float(r%103-51)*0.037123f+float(r%17)*1.e-6f;
+      h[r]=0.125f+float((r*13)%7)*0.0625f;
+    }
+    runtime.SetHistogramBins(bins,offsets,sizes);
+    runtime.SetHistogramGradients(g.data(),h.data(),rows,false);
+    for(int mode=0;mode<2;++mode) {
+      std::vector<int32_t> indices;
+      for(int r=rows-1;r>=0;--r)if(mode==0||r%3==0)indices.push_back(r);
+      const int64_t per_thread=(int64_t(indices.size())+160*16-1)/(160*16);
+      const int64_t block_rows=16*per_thread;
+      std::vector<std::vector<double>> expected_g(features),expected_h(features);
+      for(int f=0;f<features;++f)if(used[f]) {
+        const int stored=sizes[f]-offsets[f];
+        expected_g[f].assign(stored,0.);expected_h[f].assign(stored,0.);
+        for(int64_t first=0;first<int64_t(indices.size());first+=block_rows) {
+          std::vector<float> bg(stored,0.f),bh(stored,0.f);
+          const int64_t stop=std::min(first+block_rows,int64_t(indices.size()));
+          for(int64_t i=first;i<stop;++i) {
+            int r=indices[i],bin=int(bins[f][r])-offsets[f];
+            if(bin>=0){bg[bin]=bg[bin]+g[r];bh[bin]=bh[bin]+h[r];}
+          }
+          for(int b=0;b<stored;++b){expected_g[f][b]+=double(bg[b]);expected_h[f][b]+=double(bh[b]);}
+        }
+      }
+      for(int repeat=0;repeat<2;++repeat) {
+        auto result=runtime.BatchedHistogram(indices.data(),indices.size(),used);
+        for(int f=0;f<features;++f)if(used[f])
+          for(size_t b=0;b<expected_g[f].size();++b)
+            if(result.gradients[f][b]!=expected_g[f][b]||result.hessians[f][b]!=expected_h[f][b]) {
+              std::cerr<<std::setprecision(17)<<"STABLE_FP32_MISMATCH rows="<<rows<<" max_bins="<<max_bins<<" mode="<<mode<<" feature="<<f<<" bin="<<b<<" got="<<result.gradients[f][b]<<" expected="<<expected_g[f][b]<<"\n";
+              throw std::runtime_error("stable FP32 block accumulation differs");
+            }
+      }
+      std::cout<<"STABLE_FP32_CASE_PASS rows="<<rows<<" max_bins="<<max_bins<<" mode="<<mode<<"\n";
+    }
+  }
+  std::cout<<"STABLE_FP32_ALL_PASS\n";
+}
+
 int main(int argc, char** argv) {
   try {
+    if (argc > 1 && std::strcmp(argv[1], "stable_fp32") == 0) {
+      RunStableFP32HistogramProbe();return 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "quantized_select") == 0) {
       RunQuantizedSplitEvaluationProbe(true);
       RunQuantizedSelectionBoundaries();

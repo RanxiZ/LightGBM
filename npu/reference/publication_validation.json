@@ -1,0 +1,235 @@
+{
+  "pass": true,
+  "scope": "Prepared branch source built and installed on matching existing dependency environment; ordinary qrun from environment without preloaded CANN",
+  "skip_python_dependency_install": true,
+  "command": [
+    "/usr/local/bin/qrun",
+    "benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml",
+    "--experiment_name=npu_npa1_public_setup_verify",
+    "--uri_folder=/workspace/z30084427/lightgbm_npu_npa1_publish_test/qrun/mlruns"
+  ],
+  "qrun_entry": "/usr/local/bin/qrun",
+  "mapped_library": "/usr/local/python3.12.13/lib/python3.12/site-packages/lightgbm/lib/lib_lightgbm.so",
+  "library_sha256": "dc81aec245224e3a788c5730e64f4ade610d18403de3085fd340802289f6b7d2",
+  "process_wall_seconds": 71.89773033279926,
+  "all_records_present": true,
+  "reference_check": {
+    "input_fingerprints_match": true,
+    "actual_inputs": {
+      "train": {
+        "features": {
+          "rows": 491884,
+          "index_names": [
+            "datetime",
+            "instrument"
+          ],
+          "index_sha256": "f0287f01de3e364994d9888529864542f343166b20146694cae808b924b8b6d5",
+          "columns": 158,
+          "column_sha256": "d5f52c2d75ea900ab29f4742eeb59d9692254ba7307ad36a807012db7d680e13",
+          "values": {
+            "shape": [
+              491884,
+              158
+            ],
+            "dtype": "float32",
+            "exact_sha256": "c09b49e3a7d16a936fb8ccde14aaee45f46c60af112bc4a98c3d0c1edabb555b",
+            "numeric_f64_sha256": "4234070a5770838ac0e6ab714f215a9b67ceb212ea1661e2c4a96c18cb215227",
+            "nan": 425186,
+            "posinf": 0,
+            "neginf": 0
+          }
+        },
+        "labels": {
+          "rows": 491884,
+          "index_names": [
+            "datetime",
+            "instrument"
+          ],
+          "index_sha256": "f0287f01de3e364994d9888529864542f343166b20146694cae808b924b8b6d5",
+          "columns": 1,
+          "column_sha256": "7b9a09caa0f05145bbc712df50234e07078f4bb1fea9dbe796f870bf626ea352",
+          "values": {
+            "shape": [
+              491884,
+              1
+            ],
+            "dtype": "float32",
+            "exact_sha256": "6227c24fbe6412780ff50065492d1768987db0abdf1f0b94b099df122f41e47d",
+            "numeric_f64_sha256": "dff0f4185884b756002d2389395fcb559ef5de0849b77819244a04c1f87e83e0",
+            "nan": 0,
+            "posinf": 0,
+            "neginf": 0
+          }
+        },
+        "lightgbm_label_f32": {
+          "shape": [
+            491884
+          ],
+          "dtype": "float32",
+          "exact_sha256": "6227c24fbe6412780ff50065492d1768987db0abdf1f0b94b099df122f41e47d",
+          "numeric_f64_sha256": "dff0f4185884b756002d2389395fcb559ef5de0849b77819244a04c1f87e83e0",
+          "nan": 0,
+          "posinf": 0,
+          "neginf": 0
+        },
+        "weight": null
+      },
+      "valid": {
+        "features": {
+          "rows": 137788,
+          "index_names": [
+            "datetime",
+            "instrument"
+          ],
+          "index_sha256": "42cf8a153253edb3ee3ed9adcbdf04bc5d248860f9cc055874dcada94d69d273",
+          "columns": 158,
+          "column_sha256": "d5f52c2d75ea900ab29f4742eeb59d9692254ba7307ad36a807012db7d680e13",
+          "values": {
+            "shape": [
+              137788,
+              158
+            ],
+            "dtype": "float32",
+            "exact_sha256": "fe6cbddd590aa424e98ec65992da78b7bb1ba91b5ae19ce76ecb416e9924de22",
+            "numeric_f64_sha256": "1b7d42edd90ccf1427a1a8fb23ec671a100bdb2ad694a9dd42ce88742a9a701c",
+            "nan": 69999,
+            "posinf": 0,
+            "neginf": 0
+          }
+        },
+        "labels": {
+          "rows": 137788,
+          "index_names": [
+            "datetime",
+            "instrument"
+          ],
+          "index_sha256": "42cf8a153253edb3ee3ed9adcbdf04bc5d248860f9cc055874dcada94d69d273",
+          "columns": 1,
+          "column_sha256": "7b9a09caa0f05145bbc712df50234e07078f4bb1fea9dbe796f870bf626ea352",
+          "values": {
+            "shape": [
+              137788,
+              1
+            ],
+            "dtype": "float32",
+            "exact_sha256": "0afade8bd323dc33439832d2ad00a91eb08ccf16d3badae4b37dab28a4efa114",
+            "numeric_f64_sha256": "1310384a0d86c92570074454aa7546d487725adc5af3a0c414de358080558a90",
+            "nan": 0,
+            "posinf": 0,
+            "neginf": 0
+          }
+        },
+        "lightgbm_label_f32": {
+          "shape": [
+            137788
+          ],
+          "dtype": "float32",
+          "exact_sha256": "0afade8bd323dc33439832d2ad00a91eb08ccf16d3badae4b37dab28a4efa114",
+          "numeric_f64_sha256": "1310384a0d86c92570074454aa7546d487725adc5af3a0c414de358080558a90",
+          "nan": 0,
+          "posinf": 0,
+          "neginf": 0
+        },
+        "weight": null
+      },
+      "test": {
+        "features": {
+          "rows": 261207,
+          "index_names": [
+            "datetime",
+            "instrument"
+          ],
+          "index_sha256": "99012f373a1d786d223db5e526751ac1148b38f354fd0c8fdf6af3749b64ad50",
+          "columns": 158,
+          "column_sha256": "d5f52c2d75ea900ab29f4742eeb59d9692254ba7307ad36a807012db7d680e13",
+          "values": {
+            "shape": [
+              261207,
+              158
+            ],
+            "dtype": "float32",
+            "exact_sha256": "09bcbbcb019345182d7c3ffe0f568d73be8fe651f391b58244aaf95a9f7350e1",
+            "numeric_f64_sha256": "6f498dfd3680e614e52ffe463753779d8e389b3a845a8b0910d31033be7dab79",
+            "nan": 854988,
+            "posinf": 0,
+            "neginf": 0
+          }
+        },
+        "labels": {
+          "rows": 261207,
+          "index_names": [
+            "datetime",
+            "instrument"
+          ],
+          "index_sha256": "99012f373a1d786d223db5e526751ac1148b38f354fd0c8fdf6af3749b64ad50",
+          "columns": 1,
+          "column_sha256": "7b9a09caa0f05145bbc712df50234e07078f4bb1fea9dbe796f870bf626ea352",
+          "values": {
+            "shape": [
+              261207,
+              1
+            ],
+            "dtype": "float32",
+            "exact_sha256": "3cab4c2891b7db232516483db56816d743d50ce6e4ecea9009a2e9986d17cfb5",
+            "numeric_f64_sha256": "49ecdd170144c604405506d53958345f78ce63db2cb09bc8e1bad3ca2737b4ea",
+            "nan": 7072,
+            "posinf": 0,
+            "neginf": 0
+          }
+        }
+      }
+    },
+    "segments": {
+      "valid": {
+        "metrics": {
+          "MSE": 0.9938450119697531,
+          "IC": 0.05970897898893684,
+          "ICIR": 0.4697647994741397,
+          "RankIC": 0.06018959797692261,
+          "RankICIR": 0.45581161596833003
+        },
+        "delta_vs_reference": {
+          "MSE": 0.0,
+          "IC": 0.0,
+          "ICIR": 0.0,
+          "RankIC": 0.0,
+          "RankICIR": 0.0
+        }
+      },
+      "test": {
+        "metrics": {
+          "MSE": 0.004563345870638471,
+          "IC": 0.043063400500304244,
+          "ICIR": 0.35605515233814733,
+          "RankIC": 0.04533606968427339,
+          "RankICIR": 0.38505165504311134
+        },
+        "delta_vs_reference": {
+          "MSE": 0.0,
+          "IC": 0.0,
+          "ICIR": 0.0,
+          "RankIC": 0.0,
+          "RankICIR": 0.0
+        }
+      }
+    },
+    "pass": true
+  },
+  "setup_smoke": {
+    "pass": true,
+    "library": "/usr/local/python3.12.13/lib/python3.12/site-packages/lightgbm/lib/lib_lightgbm.so",
+    "sha256": "dc81aec245224e3a788c5730e64f4ade610d18403de3085fd340802289f6b7d2",
+    "qlib": "/usr/local/python3.12.13/lib/python3.12/site-packages/qlib",
+    "qrun_clean_environment_pass": true,
+    "npu_smoke_modes": [
+      {
+        "gpu_use_dp": false,
+        "trees": 3
+      },
+      {
+        "gpu_use_dp": true,
+        "trees": 3
+      }
+    ]
+  }
+}

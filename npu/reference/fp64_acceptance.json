@@ -1,0 +1,11 @@
+{
+  "valid": {
+    "max_abs": 0.0,
+    "bit_differences": 0
+  },
+  "test": {
+    "max_abs": 0.0,
+    "bit_differences": 0
+  },
+  "tree_structure_equal": true
+}

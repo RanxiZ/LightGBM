@@ -116,6 +116,7 @@ void NPUTreeLearner::Init(const Dataset* train_data, bool is_constant_hessian) {
   device_histograms_.clear();
   quantized_histograms_.clear();
   runtime_.reset(new NPURuntime(config_->gpu_device_id > 0 ? config_->gpu_device_id : 0));
+  runtime_->SetDoublePrecision(config_->gpu_use_dp);
   score_updater_.reset(new NPUScoreUpdater(runtime_.get()));
   best_split_finder_.reset(new NPUBestSplitFinder(runtime_.get()));
   data_partition_npu_.reset(new NPUDataPartition(runtime_.get()));
@@ -151,6 +152,7 @@ void NPUTreeLearner::ResetConfig(const Config* config) {
     ValidateDataset(train_data_, config);
   }
   SerialTreeLearner::ResetConfig(config);
+  runtime_->SetDoublePrecision(config_->gpu_use_dp);
   ResetExtraTreeRandom();
 }
 
@@ -475,12 +477,17 @@ void NPUTreeLearner::FindBestSplitForLeaf(
   std::vector<int> feature_indices;
   features.reserve(num_features_);
   feature_indices.reserve(num_features_);
+  int cuda_task_cursor = 0;
   for (int feature_index = 0; feature_index < num_features_; ++feature_index) {
+    const auto* task_mapper = train_data_->FeatureBinMapper(feature_index);
+    const int task_index = cuda_task_cursor;
+    cuda_task_cursor += task_mapper->num_bin() > 2 && task_mapper->missing_type() != MissingType::None && task_mapper->bin_type() != BinType::CategoricalBin ? 2 : 1;
     if (!is_feature_used[feature_index]) {
       continue;
     }
     const auto* mapper = train_data_->FeatureBinMapper(feature_index);
     NPURuntime::SplitFeature feature;
+    feature.cuda_task_index = task_index;
     feature.feature = train_data_->RealFeatureIndex(feature_index);
     // Same sources as HistogramPool::SetFeatureInfo<true, true>; FeatureHistogram
     // has no public metadata accessor in this version. feature_contri uses the
