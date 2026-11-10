@@ -1,0 +1,201 @@
+{
+  "source": "/tmp/lightgbm_forensics_7axHCT/npu_integrated_source",
+  "library_sha256": "e0dd9560a4ef54abf384797ed169b28595f4f8636d26073b0b201a0152406174",
+  "default_configuration": {
+    "device": "npu",
+    "gpu_use_dp": false
+  },
+  "fp64_configuration": {
+    "device": "npu",
+    "gpu_use_dp": true
+  },
+  "precision_environment_required": false,
+  "max_depth_semantics": "honored; use -1 explicitly for CUDA alignment experiment",
+  "protected_files_unchanged": true,
+  "runs": {
+    "integrated_default": {
+      "run": 1,
+      "split_mode": "experimental_exact_fp32_ties_fp64_refinement",
+      "library": "/tmp/lightgbm_forensics_7axHCT/npu_integrated_source/lib_lightgbm.so",
+      "library_sha256": "e0dd9560a4ef54abf384797ed169b28595f4f8636d26073b0b201a0152406174",
+      "actual_params": {
+        "objective": "mse",
+        "verbosity": -1,
+        "colsample_bytree": 0.8879,
+        "learning_rate": 0.2,
+        "subsample": 0.8789,
+        "lambda_l1": 205.6999,
+        "lambda_l2": 580.9768,
+        "max_depth": -1,
+        "num_leaves": 210,
+        "num_threads": 20,
+        "device": "npu",
+        "verbose": 2,
+        "gpu_use_dp": false,
+        "num_iterations": 1000
+      },
+      "best_iteration": 13,
+      "best_score": {
+        "train": {
+          "l2": 0.9782774350192182
+        },
+        "valid": {
+          "l2": 0.993845150589131
+        }
+      },
+      "evaluated_iterations": 63,
+      "train_seconds_lgb_train": 61.23490766296163,
+      "tree_depths": [
+        35,
+        30,
+        22,
+        24,
+        24,
+        28,
+        28,
+        30,
+        25,
+        28,
+        29,
+        27,
+        31
+      ],
+      "model_sha256": "aa00d42c8712035b2561d42becfb44858628749f3d0ba0a78b3b5d5fbae2dd9a",
+      "segments": {
+        "valid": {
+          "rows": 137788,
+          "finite_pairs": 137788,
+          "MSE": 0.9938451505891301,
+          "IC": {
+            "mean": 0.05970710119600843,
+            "std_ddof1": 0.12710298132650752,
+            "IR": 0.46975374277516196,
+            "days": 488
+          },
+          "RankIC": {
+            "mean": 0.060188255393010114,
+            "std_ddof1": 0.13204854667384092,
+            "IR": 0.45580399715927755,
+            "days": 488
+          },
+          "prediction_sha256_f64": "c174dbe35f8cacfe9bb7a27d337f9136e870ace7c032f56b8fc1bc7bf8edafa9",
+          "label_sha256_f64": "1310384a0d86c92570074454aa7546d487725adc5af3a0c414de358080558a90"
+        },
+        "test": {
+          "rows": 261207,
+          "finite_pairs": 254135,
+          "MSE": 0.004563398847794972,
+          "IC": {
+            "mean": 0.04306053455317936,
+            "std_ddof1": 0.12095248319172232,
+            "IR": 0.35601199261799293,
+            "days": 871
+          },
+          "RankIC": {
+            "mean": 0.04533504235969814,
+            "std_ddof1": 0.11774178443292485,
+            "IR": 0.3850378400331159,
+            "days": 871
+          },
+          "prediction_sha256_f64": "5bbadc73d33de30f553c95626f8e5c4adaf6973d6fc7caa6841f0c0c4846a54e",
+          "label_sha256_f64": "49ecdd170144c604405506d53958345f78ce63db2cb09bc8e1bad3ca2737b4ea"
+        }
+      },
+      "total_seconds_including_import_data_fit_predict_metrics": 87.19540152000263
+    },
+    "integrated_fp64": {
+      "run": 1,
+      "split_mode": "experimental_cuda_tie_fp64",
+      "library": "/tmp/lightgbm_forensics_7axHCT/npu_integrated_source/lib_lightgbm.so",
+      "library_sha256": "e0dd9560a4ef54abf384797ed169b28595f4f8636d26073b0b201a0152406174",
+      "actual_params": {
+        "objective": "mse",
+        "verbosity": -1,
+        "colsample_bytree": 0.8879,
+        "learning_rate": 0.2,
+        "subsample": 0.8789,
+        "lambda_l1": 205.6999,
+        "lambda_l2": 580.9768,
+        "max_depth": -1,
+        "num_leaves": 210,
+        "num_threads": 20,
+        "device": "npu",
+        "verbose": 2,
+        "gpu_use_dp": true,
+        "num_iterations": 1000
+      },
+      "best_iteration": 13,
+      "best_score": {
+        "train": {
+          "l2": 0.9782774350234975
+        },
+        "valid": {
+          "l2": 0.9938447634409642
+        }
+      },
+      "evaluated_iterations": 63,
+      "train_seconds_lgb_train": 63.38002784829587,
+      "tree_depths": [
+        35,
+        30,
+        22,
+        24,
+        24,
+        28,
+        28,
+        30,
+        25,
+        28,
+        29,
+        27,
+        31
+      ],
+      "model_sha256": "550cc4f8543190f0b9233bf912f5a57f52176271627ebd6e9c8027039796dc32",
+      "segments": {
+        "valid": {
+          "rows": 137788,
+          "finite_pairs": 137788,
+          "MSE": 0.9938447634409637,
+          "IC": {
+            "mean": 0.05971181502703683,
+            "std_ddof1": 0.12710394246727819,
+            "IR": 0.4697872769950399,
+            "days": 488
+          },
+          "RankIC": {
+            "mean": 0.06019057912335662,
+            "std_ddof1": 0.13204690190875779,
+            "IR": 0.4558272723804403,
+            "days": 488
+          },
+          "prediction_sha256_f64": "f1498ed8a7e238aa870c5be4c99b9e2ed43d34e72b2352e08880eeddd1ff59c7",
+          "label_sha256_f64": "1310384a0d86c92570074454aa7546d487725adc5af3a0c414de358080558a90"
+        },
+        "test": {
+          "rows": 261207,
+          "finite_pairs": 254135,
+          "MSE": 0.004563331003400061,
+          "IC": {
+            "mean": 0.043066092133445213,
+            "std_ddof1": 0.12094697590142268,
+            "IR": 0.35607415408671356,
+            "days": 871
+          },
+          "RankIC": {
+            "mean": 0.0453348881565322,
+            "std_ddof1": 0.11774227052073137,
+            "IR": 0.38503494077388206,
+            "days": 871
+          },
+          "prediction_sha256_f64": "b4bb7f2434200a5d34159bd6554b2355cd04c2edb4ca60e11670a6c143c699bd",
+          "label_sha256_f64": "49ecdd170144c604405506d53958345f78ce63db2cb09bc8e1bad3ca2737b4ea"
+        }
+      },
+      "total_seconds_including_import_data_fit_predict_metrics": 89.25340117095038
+    }
+  },
+  "fp64_max_prediction_delta": {
+    "valid": 0.0,
+    "test": 0.0
+  }
+}

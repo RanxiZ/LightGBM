@@ -1139,6 +1139,7 @@ struct Config {
 
   // desc = set this to ``true`` to use double precision math on GPU (by default single precision is used)
   // desc = **Note**: can be used only in OpenCL implementation (``device_type="gpu"``), in CUDA implementation only double precision is currently supported
+  // desc = for NPU, false selects mixed-precision SIMT and true selects the FP64 split path
   bool gpu_use_dp = false;
 
   // check = >0

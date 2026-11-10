@@ -485,3 +485,11 @@ dmypy.json
 
 # files created by release tasks
 /release-artifacts
+
+# NPU reproduction build and local installation state
+/build-npu-npa0/
+/npu/_state/
+/npu_reference_check.json
+/npu/__pycache__/
+/npu/tests/__pycache__/
+/npu/reference/__pycache__/

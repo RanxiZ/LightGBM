@@ -40,6 +40,8 @@
 #include <aclnnop/aclnn_square.h>
 #include <aclnnop/aclnn_sub.h>
 
+#include <fstream>
+#include <iomanip>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -739,7 +741,12 @@ NPURuntime::HistogramHandle NPURuntime::BuildHistogramFromDeviceRows(
     CHECK(impl_->histogram_pairs.data() != nullptr);
     impl_->EnsureSimtMetadata(used);
     if (impl_->simt_num_used == 0) return result;
-    const int row_chunks = PlanRowChunks(count, impl_->simt_partitions);
+    const bool fp32_blocks=!double_precision_ &&
+      std::getenv("LGBM_NPU_DISABLE_SIMT_SPLIT")==nullptr;
+    const int row_chunks = fp32_blocks ? 160 : PlanRowChunks(count, impl_->simt_partitions);
+    int row_group=16;
+    if(const char* v=std::getenv("LGBM_NPU_FP32_ROW_GROUP"))row_group=std::atoi(v);
+    CHECK_GT(row_group,0);
     // shift_gap sets the coarse grid so that count * 2^shift_gap stays inside
     // the 61-bit signed window (see simt_fixed_point.h).
     const int32_t shift_gap = 61 - lgbm_simt::CeilLog2Count(count);
@@ -758,7 +765,7 @@ NPURuntime::HistogramHandle NPURuntime::BuildHistogramFromDeviceRows(
         static_cast<double*>(result->values.data()), result->features,
         impl_->simt_num_used, count, impl_->histogram_stride,
         impl_->simt_partitions, row_chunks, impl_->simt_kernel_stride,
-        shift_gap, 1);
+        shift_gap, fp32_blocks ? 100+row_group : 1);
     ACL_CHECK(aclrtSynchronizeStream(impl_->stream));
     return result;
   }
@@ -2554,6 +2561,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
       metadata.feature = f.feature;
       metadata.input_index = static_cast<int32_t>(fi);
       metadata.histogram_index = f.histogram_index;
+      metadata.cuda_task_index = f.cuda_task_index;
       metadata.num_bin = f.num_bin;
       metadata.offset = f.offset;
       metadata.default_bin = f.default_bin;
@@ -2615,7 +2623,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
     if (!impl_->simt_split_failed && max_delta_step <= 0.0 &&
         simt_penalty_supported && !simt_random_gate_diverges &&
         !(simt_randomized && simt_exhaustive) &&
-        std::getenv("LGBM_NPU_DISABLE_SIMT_SPLIT") == nullptr) {
+        !double_precision_ && std::getenv("LGBM_NPU_DISABLE_SIMT_SPLIT") == nullptr) {
       if (impl_->simt_split == nullptr) {
         std::unique_ptr<lgbm_npu_simt::SimtSplitOperator> candidate_operator(
             new lgbm_npu_simt::SimtSplitOperator());
@@ -2669,6 +2677,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
               metadata.num_bin > 2 && metadata.missing_type != 0;
           lgbm_npu_simt::SimtSplitTask task = {};
           task.inner_feature_index = metadata.feature;
+          task.reserved = static_cast<uint32_t>(metadata.cuda_task_index);
           task.input_index = metadata.input_index;
           task.hist_offset = static_cast<int64_t>(metadata.histogram_index) *
                              static_cast<int64_t>(histogram->stride);
@@ -2686,6 +2695,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
             task.assume_out_default_left = 0;
             simt_tasks.push_back(task);
             task.reverse = 1;
+            task.reserved = static_cast<uint32_t>(metadata.cuda_task_index + 1);
             task.assume_out_default_left = 1;
             simt_tasks.push_back(task);
           } else {
@@ -2760,23 +2770,20 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
             // The device merge already applies "first maximum gain in task
             // order", but it cannot see `enabled`; redo the merge on the host
             // when the device winner belongs to a disabled feature.
+
+            auto cuda_rank = [](uint32_t i) {
+              uint32_t l=i%32,w=(i%1024)/32,rl=0,rw=0;
+              for(int j=0;j<5;++j){rl=(rl<<1)|(l&1);l>>=1;rw=(rw<<1)|(w&1);w>>=1;}
+              return (i/1024)*1024+rw*32+rl;
+            };
             int32_t best_task = -1;
-            if (simt_winner.is_valid != 0 &&
-                features[static_cast<size_t>(simt_winner.input_index)].enabled) {
-              best_task = static_cast<int32_t>(simt_winner.task_index);
-            } else {
-              for (size_t task_index = 0; task_index < simt_candidates.size();
-                   ++task_index) {
-                const auto& candidate = simt_candidates[task_index];
-                if (candidate.is_valid == 0) continue;
-                if (!features[static_cast<size_t>(candidate.input_index)].enabled) {
-                  continue;
-                }
-                if (best_task < 0 ||
-                    candidate.gain > simt_candidates[best_task].gain) {
-                  best_task = static_cast<int32_t>(task_index);
-                }
-              }
+            for(size_t j=0;j<simt_candidates.size();++j) {
+              const auto& c=simt_candidates[j];
+              if(!c.is_valid || !features[c.input_index].enabled)continue;
+              if(best_task<0 || c.gain>simt_candidates[best_task].gain ||
+                (c.gain==simt_candidates[best_task].gain &&
+                 cuda_rank(simt_tasks[j].reserved)<cuda_rank(simt_tasks[best_task].reserved)))
+                best_task=static_cast<int32_t>(j);
             }
             ++argmax_calls_;
             if (best_task >= 0) {
@@ -2801,6 +2808,79 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
                   static_cast<double>(winner.right_sum_hessians);
               result.left_count = winner.left_count;
               result.right_count = winner.right_count;
+              // SIMT owns feature, threshold and direction selection.
+              // Re-evaluate only that selected split on resident FP64 bins.
+              LGBMNPUFusedSplitFeature rf = {};
+              bool refinement_metadata_found=false;
+              for(const auto& f:packed) {
+                if(f.input_index==winner.input_index) {
+                  rf=f;refinement_metadata_found=true;break;
+                }
+              }
+              CHECK(refinement_metadata_found);
+              rf.input_index=0;rf.enabled=1;rf.randomized=1;
+              rf.random_threshold=static_cast<int32_t>(winner.threshold);
+              rf.refine_direction=0;
+              std::vector<LGBMNPUFusedSplitFeature> refine_features;
+              for(size_t j=0;j<simt_candidates.size();++j) {
+                const auto& candidate=simt_candidates[j];
+                if(!candidate.is_valid || candidate.gain!=winner.gain ||
+                   !features[candidate.input_index].enabled)continue;
+                bool duplicate=false;
+                for(const auto& q:refine_features)
+                  if(q.feature==static_cast<int32_t>(candidate.inner_feature_index) &&
+                     q.random_threshold==static_cast<int32_t>(candidate.threshold))duplicate=true;
+                if(duplicate)continue;
+                for(const auto& q:packed)if(q.input_index==candidate.input_index) {
+                  auto selected=q;selected.input_index=static_cast<int32_t>(refine_features.size());
+                  selected.enabled=1;selected.randomized=1;
+                  selected.random_threshold=static_cast<int32_t>(candidate.threshold);
+                  selected.refine_direction=0;refine_features.push_back(selected);break;
+                }
+              }
+              CHECK(!refine_features.empty());
+
+    LGBMNPUFusedSplitParameters rp = {};
+    rp.histogram_plane = static_cast<int64_t>(histogram->features) * histogram->stride;
+    rp.histogram_stride = histogram->stride;
+    rp.num_features = static_cast<int32_t>(refine_features.size());
+    rp.num_data = num_data;
+    rp.min_data_in_leaf = min_data_in_leaf;
+    rp.sum_gradient = sum_gradient;
+    rp.sum_hessian = sum_hessian;
+    rp.lambda_l1 = lambda_l1;
+    rp.lambda_l2 = lambda_l2;
+    rp.min_sum_hessian_in_leaf = min_sum_hessian_in_leaf;
+    rp.min_gain_to_split = min_gain_to_split;
+    rp.max_delta_step = max_delta_step;
+    rp.path_smooth = path_smooth;
+    rp.parent_output = parent_output;
+
+
+              DeviceBuffer rfeatures=impl_->Upload(refine_features.data(),refine_features.size()*sizeof(rf));
+              DeviceBuffer rparams=impl_->Upload(&rp,sizeof(rp));
+              DeviceBuffer rwinner=impl_->Zeros(sizeof(LGBMNPUFusedSplitWinner));
+              DeviceBuffer rflags=impl_->Zeros(refine_features.size()*sizeof(uint8_t));
+              LGBMNPUFusedSplitKernel(1,nullptr,impl_->stream,
+                static_cast<const double*>(histogram->values.data()),
+                static_cast<const LGBMNPUFusedSplitFeature*>(rfeatures.data()),
+                static_cast<const LGBMNPUFusedSplitParameters*>(rparams.data()),
+                static_cast<LGBMNPUFusedSplitWinner*>(rwinner.data()),
+                static_cast<uint8_t*>(rflags.data()));
+              ACL_CHECK(aclrtSynchronizeStream(impl_->stream));
+              LGBMNPUFusedSplitWinner refined={};
+              impl_->Download(&refined,rwinner,sizeof(refined));
+              if(refined.completed!=1 || refined.feature<0)
+                Log::Fatal("SIMT tied candidate FP64 refinement failed");
+              result.feature=refined.feature;
+              result.threshold=refined.threshold;
+              result.default_left=refined.default_left!=0;
+              result.gain=refined.gain;
+              result.left_output=refined.left_output;result.right_output=refined.right_output;
+              result.left_gradient=refined.left_gradient;result.right_gradient=refined.right_gradient;
+              result.left_hessian=refined.left_hessian;result.right_hessian=refined.right_hessian;
+              result.left_count=refined.left_count;result.right_count=refined.right_count;
+
             }
             return result;
           }
@@ -2808,6 +2888,7 @@ NPURuntime::SplitResult NPURuntime::FindBestSplit(
       }
     }
 
+    if (std::getenv("LGBM_NPU_REQUIRE_SIMT") != nullptr) Log::Fatal("Required default SIMT path was not selected");
     LGBMNPUFusedSplitParameters parameters = {};
     parameters.histogram_plane = static_cast<int64_t>(histogram->features) * histogram->stride;
     parameters.histogram_stride = histogram->stride;

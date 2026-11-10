@@ -8,6 +8,16 @@
 Light Gradient Boosting Machine
 ===============================
 
+## Ascend NPU reproduction: lightgbm_npu_npa0
+
+This branch freezes the precision-integrated NPU implementation before performance optimization (historical full qrun: 106.87 seconds).
+See [the NPU installation and reproduction guide](npu/README.zh-CN.md). After one-time setup:
+
+```bash
+cd /workspace/qlib/examples
+qrun benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml
+```
+
 [![C++ GitHub Actions Build Status](https://github.com/lightgbm-org/LightGBM/actions/workflows/cpp.yml/badge.svg?branch=main)](https://github.com/lightgbm-org/LightGBM/actions/workflows/cpp.yml)
 [![Python-package GitHub Actions Build Status](https://github.com/lightgbm-org/LightGBM/actions/workflows/python_package.yml/badge.svg?branch=main)](https://github.com/lightgbm-org/LightGBM/actions/workflows/python_package.yml)
 [![R-package GitHub Actions Build Status](https://github.com/lightgbm-org/LightGBM/actions/workflows/r_package.yml/badge.svg?branch=main)](https://github.com/lightgbm-org/LightGBM/actions/workflows/r_package.yml)

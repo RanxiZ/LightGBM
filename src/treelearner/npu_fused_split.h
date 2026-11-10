@@ -15,8 +15,10 @@ struct LGBMNPUFusedSplitFeature {
   int32_t default_bin;
   int32_t missing_type;
   int32_t enabled;
+  int32_t cuda_task_index;
   int32_t randomized;
   int32_t random_threshold;
+  int32_t refine_direction;  // 0 unrestricted, 1 forward, 2 reverse
   double penalty;
 };
 
@@ -67,7 +69,7 @@ extern "C" void LGBMNPUFusedSplitKernel(
     const LGBMNPUFusedSplitParameters* parameters,
     LGBMNPUFusedSplitWinner* winner, uint8_t* splittable);
 
-static_assert(sizeof(LGBMNPUFusedSplitFeature) == 48, "fused split feature ABI");
+static_assert(sizeof(LGBMNPUFusedSplitFeature) == 56, "fused split feature ABI");
 static_assert(sizeof(LGBMNPUFusedSplitParameters) == 96, "fused split parameter ABI");
 static_assert(sizeof(LGBMNPUFusedSplitWinner) == 80, "fused split winner ABI");
 

@@ -45,8 +45,12 @@ inline double LeafGain(
            (hessian + p.lambda_l2) * output * output);
 }
 
+inline unsigned Reverse5(unsigned x) { unsigned r=0; for(int i=0;i<5;++i){r=(r<<1)|(x&1);x>>=1;}return r;}
+inline unsigned CudaRank(unsigned i) {return (i/1024)*1024+Reverse5((i%1024)/32)*32+Reverse5(i%32);}
+
 struct DirectionWinner {
   bool valid;
+  unsigned priority;
   uint32_t threshold;
   double current_gain;
   double left_gradient;
@@ -126,8 +130,10 @@ inline DirectionWinner ScanDirection(
     const double current_gain = LeafGain(left_gradient, left_hessian, left_count, p) +
                                 LeafGain(right_gradient, right_hessian, right_count, p);
     if (!(current_gain > gain_shift)) continue;
-    // First equal-gain candidate wins within a scan, before any penalty.
-    if (!best.valid || current_gain > best.current_gain) {
+    const unsigned slot=reverse ? f.num_bin-2-threshold : ((!reverse && f.missing_type==2 && f.offset==1) ? threshold : threshold-f.offset);
+    const unsigned priority=CudaRank(slot);
+    if (!best.valid || current_gain > best.current_gain || (current_gain==best.current_gain && priority<best.priority)) {
+      best.priority=priority;
       best.valid = true;
       best.threshold = static_cast<uint32_t>(threshold);
       best.current_gain = current_gain;
@@ -150,6 +156,7 @@ extern "C" __global__ __aicpu__ unsigned int LGBMNPUFusedSplitKernel(
   const LGBMNPUFusedSplitParameters& p = *parameters;
   LGBMNPUFusedSplitWinner result = {};
   result.feature = -1;
+  unsigned result_priority=~0u;
   const double total_hessian = p.sum_hessian + 2.0 * kSplitEpsilon;
   const double count_factor = static_cast<double>(p.num_data) / total_hessian;
   const double gain_shift = LeafGain(p.sum_gradient, total_hessian, p.num_data, p) +
@@ -162,28 +169,30 @@ extern "C" __global__ __aicpu__ unsigned int LGBMNPUFusedSplitKernel(
     const double* gradients = histogram + begin;
     const double* hessians = histogram + p.histogram_plane + begin;
     const bool double_scan = f.num_bin > 2 && f.missing_type != 0;
-    DirectionWinner chosen = ScanDirection(gradients, hessians, f, p, true,
+    // Experimental CUDA task order: forward first for double-scan features.
+    bool reverse = f.refine_direction == 2 || !double_scan;
+    DirectionWinner chosen = ScanDirection(gradients, hessians, f, p, reverse,
                                            double_scan, total_hessian,
                                            count_factor, gain_shift);
-    bool reverse = true;
-    if (double_scan) {
-      const DirectionWinner forward = ScanDirection(gradients, hessians, f, p, false,
-                                                    true, total_hessian,
-                                                    count_factor, gain_shift);
-      splittable[f.input_index] = chosen.valid || forward.valid;
-      // The CPU scanner stores reverse_gain-shift and adds shift back before
-      // accepting the forward winner. Do not reduce the two shifted gains.
-      if (forward.valid && (!chosen.valid ||
-          forward.current_gain > (chosen.current_gain - gain_shift) + gain_shift)) {
-        chosen = forward;
-        reverse = false;
+    if (double_scan && f.refine_direction == 0) {
+      const DirectionWinner backward = ScanDirection(gradients, hessians, f, p, true,
+                                                     true, total_hessian,
+                                                     count_factor, gain_shift);
+      splittable[f.input_index] = chosen.valid || backward.valid;
+      if (backward.valid && (!chosen.valid ||
+          backward.current_gain - gain_shift > chosen.current_gain - gain_shift ||
+          (backward.current_gain - gain_shift == chosen.current_gain - gain_shift && CudaRank(f.cuda_task_index+1)<CudaRank(f.cuda_task_index)))) {
+        chosen = backward;
+        reverse = true;
       }
     } else {
       splittable[f.input_index] = chosen.valid;
     }
     if (!chosen.valid || !f.enabled) continue;
     const double gain = (chosen.current_gain - gain_shift) * f.penalty;
-    if (result.feature >= 0 && !(gain > result.gain)) continue;
+    const unsigned task_priority=CudaRank(f.cuda_task_index + (double_scan && reverse));
+    if (result.feature >= 0 && !(gain > result.gain || (gain==result.gain && task_priority<result_priority))) continue;
+    result_priority=task_priority;
     // Feature metadata is stable-sorted, so equal-gain features retain the
     // first (lowest original feature index), including zero penalties.
     result.feature = f.feature;
@@ -194,8 +203,8 @@ extern "C" __global__ __aicpu__ unsigned int LGBMNPUFusedSplitKernel(
     // CPU serializes the right side by subtracting its stored left side,
     // even for a reverse scan. Preserve that FP64 round trip separately
     // from gain evaluation, which uses the original accumulated right side.
-    const double output_right_gradient = p.sum_gradient - chosen.left_gradient;
-    const double output_right_hessian = total_hessian - chosen.left_hessian;
+    const double output_right_gradient = chosen.right_gradient;
+    const double output_right_hessian = chosen.right_hessian;
     result.right_gradient = output_right_gradient;
     result.left_hessian = chosen.left_hessian - kSplitEpsilon;
     result.right_hessian = output_right_hessian - kSplitEpsilon;

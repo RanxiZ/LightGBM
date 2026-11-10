@@ -1,0 +1,25 @@
+{
+  "branch": "lightgbm_npu_npa0",
+  "historical_source": "/tmp/lightgbm_forensics_7axHCT/npu_integrated_source",
+  "historical_library_sha256": "e0dd9560a4ef54abf384797ed169b28595f4f8636d26073b0b201a0152406174",
+  "exported_files": 610,
+  "historical_source_files_match": 608,
+  "packaging_only_differences": [
+    ".gitignore",
+    "README.md"
+  ],
+  "qlib_original_modules_verified": [
+    "qlib/backtest/high_performance_ds.py",
+    "qlib/contrib/model/__init__.py",
+    "qlib/utils/index_data.py"
+  ],
+  "qlib_archive_sha256_verified": true,
+  "installation_unit_tests": {
+    "passed": 6,
+    "failed": 0
+  },
+  "python_syntax_check": true,
+  "hardware_revalidation_performed_for_this_publication": false,
+  "hidevlab_installation_modified": false,
+  "scope": "Local source and installer validation; historical hardware runs retained separately; no deployment or current environment modification"
+}

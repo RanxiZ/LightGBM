@@ -1,0 +1,17 @@
+{
+  "python": "3.12.13",
+  "platform": "Linux-6.6.0-132.0.0.111.oe2403sp3.x86_64-x86_64-with-glibc2.35",
+  "packages": {
+    "lightgbm": "4.7.0.99",
+    "pyqlib": "0.9.8",
+    "numpy": "2.0.0",
+    "pandas": "2.3.3",
+    "ruamel.yaml": "0.19.1",
+    "mlflow": "3.12.0",
+    "cmake": "3.31.6",
+    "scipy": "1.13.1",
+    "scikit-learn": "1.9.1"
+  },
+  "/workspace/LightGBM_git_head": "f301da0f4d19230c4a0d8ded82bfe0d75fc69195",
+  "/workspace/qlib_git_head": "be338d3c2ee8f0aa462015e4ba888a5a7682a10e"
+}

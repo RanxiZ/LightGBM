@@ -1,0 +1,8 @@
+{
+  "project": "Microsoft Qlib",
+  "source_commit": "be338d3c2ee8f0aa462015e4ba888a5a7682a10e",
+  "version": "0.9.8",
+  "format": "git archive HEAD; tracked source files only",
+  "archive_sha256": "409bef082a5ffb0cab1bc3d90acdc897f5b3e73d6a8189dd4574c5451d70b8be",
+  "license": "MIT; see QLIB_LICENSE"
+}

@@ -14,6 +14,7 @@ class NPURuntime {
  public:
   explicit NPURuntime(int device);
   ~NPURuntime();
+  void SetDoublePrecision(bool enabled) { double_precision_ = enabled; }
   NPURuntime(const NPURuntime&) = delete;
   NPURuntime& operator=(const NPURuntime&) = delete;
 
@@ -136,6 +137,7 @@ class NPURuntime {
 
   struct SplitFeature {
     int feature = -1;  // Original feature index, used for deterministic ties.
+    int cuda_task_index = -1;
     int histogram_index = -1;  // Internal feature index in a device histogram.
     int num_bin = 0;
     int offset = 0;
@@ -253,6 +255,7 @@ class NPURuntime {
   uint64_t gain_calls() const { return gain_calls_; }
   uint64_t argmax_calls() const { return argmax_calls_; }
  private:
+  bool double_precision_ = false;
   struct Impl;
   std::unique_ptr<Impl> impl_;
   uint64_t histogram_calls_ = 0, prefix_calls_ = 0, gain_calls_ = 0, argmax_calls_ = 0;

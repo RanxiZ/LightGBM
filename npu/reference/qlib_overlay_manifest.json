@@ -1,0 +1,14 @@
+{
+  "qlib/backtest/high_performance_ds.py": {
+    "original_sha256": "2b12cc6df8d7da794230536cef5014f3bd6bb0db1183c5369c647cf19bd1a207",
+    "patched_sha256": "2b12cc6df8d7da794230536cef5014f3bd6bb0db1183c5369c647cf19bd1a207"
+  },
+  "qlib/contrib/model/__init__.py": {
+    "original_sha256": "8f679e3fd0998515a64b291fea3e7d42cd2eb1819290058f4cf0621b36cb2386",
+    "patched_sha256": "8f679e3fd0998515a64b291fea3e7d42cd2eb1819290058f4cf0621b36cb2386"
+  },
+  "qlib/utils/index_data.py": {
+    "original_sha256": "2851f0acc9c95ef1666f799ab5549f4330c504f41a7cde5bc03690acb7052e5a",
+    "patched_sha256": "2851f0acc9c95ef1666f799ab5549f4330c504f41a7cde5bc03690acb7052e5a"
+  }
+}
